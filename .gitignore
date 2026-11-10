@@ -1,0 +1,30 @@
+/target
+/state
+/fixtures/gen/data/bench
+/fixtures/gen/data/block-big
+/docs/assets/*.tmp
+.DS_Store
+
+# Local checkout used by fixtures/gen/go.mod
+/prometheus/
+
+# Local workspace memory
+/.workbuddy/memory/
+
+# Go build and test output
+/fixtures/gen/tsdbfixture
+/fixtures/gen/tsdbfixture.exe
+/fixtures/gen/*.test
+/fixtures/gen/coverage.out
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs and editor temporary files
+*.log
+*.swp
+*.swo
+*~
+Thumbs.db

@@ -1,0 +1,145 @@
+# tsdb-migrate
+
+把 Prometheus TSDB Block 中的海量历史样本，以**有界内存、可暂停/恢复、不重不漏**的方式迁移到 Parquet / DuckDB。Rust 实现，不依赖 Go runtime，不构建 Prometheus 查询引擎。
+
+```
+Prometheus Blocks ──▶ tsdb-reader ──▶ migrate-core ──▶ Parquet (Hive 分区) ──▶ DuckDB
+                         │                 │
+                    index/chunks/      pipeline / checkpoint / sink
+                    tombstones
+                         │
+              CLI  ◀─────┴─────▶ HTTP API + Web 控制台
+```
+
+## 特性
+
+- **零拷贝读取**：mmap index 与 chunk segment；只建立 `symbols/32` 的偏移表，不把全部 label 字符串放内存。
+- **全编码支持**：XOR、XOR2、Histogram、FloatHistogram、HistogramST、FloatHistogramST。
+- **Tombstones 感知**：按 series ref + 闭区间过滤，不导出已删除样本。
+- **有界内存流水线**：Block 级并行 × 块内解码线程，背压 + 批量 + 单元屏障；内存与数据总量无关。
+- **断点续传**：单元级 checkpoint + 确定性 part 文件名，恢复时清理未提交尾部，part 粒度不重不漏。
+- **三种交付形态**：本地 CLI、可部署 HTTP API、内嵌 Web 控制台（启动/暂停/恢复/停止 + 详细进度）。
+- **DuckDB 原生**：输出 Hive 分区的三张表（series/samples/histograms），生成 `load_duckdb.sql`，可选调用 duckdb CLI 装载。
+
+## 快速开始
+
+### CLI
+
+```bash
+cargo build --release
+
+# 查看块
+./target/release/tsdb-migrate inspect --data-dir /prometheus/data
+
+# 迁移到 Parquet
+./target/release/tsdb-migrate migrate \
+  --data-dir /prometheus/data \
+  --out /mnt/export \
+  --block-parallel 2 --decode-workers 4
+
+# 校验行数
+./target/release/tsdb-migrate verify --out /mnt/export
+
+# DuckDB 装载
+./target/release/tsdb-migrate duckdb-load --out /mnt/export --db /mnt/metrics.duckdb
+```
+
+中断后再次执行同一条 `migrate` 命令即可续跑（默认 `resume=true`）；已完成块会跳过。
+
+### Server + Web
+
+```bash
+TSDB_MIGRATE_TOKEN=change-me ./target/release/tsdb-migrate-server \
+  --bind 0.0.0.0:8080 \
+  --state-dir /var/lib/tsdb-migrate \
+  --allow-root /prometheus \
+  --allow-root /mnt/export
+```
+
+打开 `http://<host>:8080/`：新建任务、扫描 Block、启动/暂停/恢复/停止、查看总体与分块进度、吞吐、ETA、日志。
+
+## 输出
+
+```
+<out>/
+├── manifest.json
+├── load_duckdb.sql
+├── .state/blocks/<ULID>.json          # checkpoint
+└── blocks/block=<ULID>/
+    ├── _complete.json
+    ├── series/part-u000000-w00.parquet
+    ├── samples/part-u000000-w00.parquet
+    └── histograms/part-u000000-w00.parquet
+```
+
+| 表 | 列 |
+|----|----|
+| `series` | `series_uid, series_ref, labels MAP, block` |
+| `samples` | `series_uid, ts, value, block` |
+| `histograms` | `series_uid, ts, st, count, zero_count, sum, schema, zero_threshold, pos_spans, neg_spans, pos_buckets, neg_buckets, custom_values, reset_hint, block` |
+
+```sql
+SELECT labels['__name__'], count(*)
+FROM samples s JOIN series x USING (series_uid)
+WHERE s.block = x.block
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
+## 文档
+
+| 文档 | 内容 |
+|------|------|
+| [docs/00-architecture.md](docs/00-architecture.md) | 架构、组件边界、并发/内存模型、输出模型 |
+| [docs/01-roadmap.md](docs/01-roadmap.md) | 分阶段方案、交付物、验收标准与状态 |
+| [docs/02-format-notes.md](docs/02-format-notes.md) | Index/Chunks/Tombstones/ChunkEnc 字段级说明与踩坑 |
+| [docs/03-api.md](docs/03-api.md) | HTTP API 契约、状态机、错误码 |
+| [docs/04-operations.md](docs/04-operations.md) | 部署、调参、DuckDB、故障恢复、监控 |
+| [docs/05-verification.md](docs/05-verification.md) | 对拍、端到端、断点续传、性能实测与已知限制 |
+
+## 仓库结构
+
+```
+crates/
+  tsdb-reader/           # 纯格式层：meta/index/chunks/tombstones/chunkenc
+  migrate-core/          # 规划、流水线、控制、checkpoint、sink、manifest、DuckDB
+  tsdb-migrate-cli/      # tsdb-migrate 二进制
+  tsdb-migrate-server/   # tsdb-migrate-server 二进制（内嵌 web/）
+web/                     # 单页控制台（无构建、无外链）
+fixtures/gen/            # Go 生成器：真实 Block + 6 种编码 fixture + ground truth
+docs/                    # 架构/路线图/格式/API/运维/验证
+scripts/                 # dev-fixtures.sh / e2e.sh / bench.sh
+prometheus/              # 本项目依赖的 Prometheus 源码快照（只读参考）
+```
+
+## 测试
+
+```bash
+cargo test --workspace        # 29 个测试：格式对拍、CRC、状态机、配置、路径安全
+scripts/e2e.sh                # fixture → Parquet → verify → DuckDB
+scripts/bench.sh gen 20000    # 生成 2000 万级样本基准块
+scripts/bench.sh              # release 吞吐/RSS
+```
+
+`cargo test` 依赖 `fixtures/gen/data/block`（已随仓库保留）。重新生成：
+
+```bash
+scripts/dev-fixtures.sh        # 需要 Go 1.26+
+```
+
+## 性能（M 系列 10 核，release）
+
+- 单块 20002 series / 2880 万样本：0.93–1.04s，峰值 RSS 72–110 MiB。
+- 4 块 1.15 亿样本，`block_parallel=4`：1.66s，302 MiB，69.4M samples/s。
+- 内存 ≈ 基础 + 并发度 × 每 worker 缓冲；与数据总量无关。
+
+## 已知限制
+
+- 只读已落盘 Block；不读取 Head/WAL/`chunks_head`。
+- 不解析 postings；标签过滤在 series 遍历时进行。
+- 不做跨块去重；输出保留 `block` 分区，重叠块会在 `inspect` 中告警。
+- 单线程 chunk 吞吐约 45 MB/s，未达 100 MB/s 目标（多块并发约 113 MB/s）；详见验证报告。
+- `unit_series` 过小会导致大量 fsync，生产建议 5 万级。
+
+## License
+
+Apache-2.0（与仓库内 Prometheus 源码许可一致）。

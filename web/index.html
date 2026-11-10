@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tsdb-migrate · Prometheus 历史数据迁移</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="name">TSDB-MIGRATE</span>
+      <span class="sub">Prometheus Blocks → Parquet / DuckDB</span>
+    </div>
+    <div class="spacer"></div>
+    <div class="health" id="health"><span class="dot" id="healthDot"></span><span id="healthText">连接中…</span></div>
+    <button class="ghost" id="tokenBtn" title="设置 API Bearer Token">Token</button>
+    <span class="kbd">v0.1</span>
+  </header>
+
+  <aside class="sidebar">
+    <div class="side-head">
+      <span class="side-title">迁移任务</span>
+      <button class="primary" id="newJobBtn">＋ 新建</button>
+    </div>
+    <div class="job-list" id="jobList"></div>
+    <div class="side-foot">
+      <span id="jobCount">0 个任务</span>
+      <span id="apiVersion" class="mono"></span>
+    </div>
+  </aside>
+
+  <main class="main" id="main">
+    <div class="empty" id="emptyState">
+      <div class="big">NO JOB SELECTED</div>
+      <div>从左侧选择任务，或新建一个迁移任务</div>
+      <div class="faint">支持 Prometheus TSDB Block 全量导出 · 断点续传 · 暂停/恢复</div>
+    </div>
+
+    <div id="jobView" class="hidden">
+      <div class="job-head">
+        <div>
+          <h1 id="jobName">—</h1>
+          <div class="sub">
+            <span class="mono" id="jobId"></span>
+            <span class="faint"> · </span>
+            <span id="jobSink"></span>
+            <span class="faint"> · </span>
+            <span id="jobElapsed"></span>
+          </div>
+        </div>
+        <div class="actions">
+          <span class="badge created" id="jobState">created</span>
+          <button id="btnStart">启动</button>
+          <button id="btnPause">暂停</button>
+          <button id="btnResume">恢复</button>
+          <button id="btnStop" class="danger">停止</button>
+          <button id="btnDelete" class="ghost danger" title="仅删除任务记录，不删除已导出的数据">删除</button>
+        </div>
+      </div>
+
+      <div class="error-banner hidden" id="errorBanner"></div>
+
+      <div class="kpis">
+        <div class="kpi accent">
+          <div class="k">总体进度</div>
+          <div class="v" id="kpiPct">0.0%</div>
+          <div class="s" id="kpiPctSub">chunks 0 / 0</div>
+        </div>
+        <div class="kpi">
+          <div class="k">已迁移样本</div>
+          <div class="v" id="kpiSamples">0</div>
+          <div class="s" id="kpiSamplesSub">float 0 · hist 0</div>
+        </div>
+        <div class="kpi">
+          <div class="k">吞吐</div>
+          <div class="v" id="kpiRate">0</div>
+          <div class="s" id="kpiRateSub">samples/s · 0 MiB/s</div>
+        </div>
+        <div class="kpi">
+          <div class="k">预计剩余</div>
+          <div class="v" id="kpiEta">--</div>
+          <div class="s" id="kpiEtaSub">已运行 0s</div>
+        </div>
+        <div class="kpi">
+          <div class="k">块进度</div>
+          <div class="v" id="kpiBlocks">0 / 0</div>
+          <div class="s" id="kpiBlocksSub">完成 0 · 失败 0 · 跳过 0</div>
+        </div>
+        <div class="kpi" id="kpiErrorBox">
+          <div class="k">过滤 / 错误</div>
+          <div class="v" id="kpiErrors">0</div>
+          <div class="s" id="kpiErrorsSub">tombstone 0 · 范围 0</div>
+        </div>
+      </div>
+
+      <div class="progress-panel">
+        <div class="progress-row">
+          <div class="label">CHUNKS</div>
+          <div class="bar" id="barChunks"><span style="width:0%"></span></div>
+          <div class="nums" id="numChunks">0 / 0</div>
+        </div>
+        <div class="progress-row">
+          <div class="label">SERIES</div>
+          <div class="bar green" id="barSeries"><span style="width:0%"></span></div>
+          <div class="nums" id="numSeries">0 / 0</div>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="section-head">
+          <h2>Block 明细</h2>
+          <div class="tools">
+            <select id="blockStatusFilter">
+              <option value="">全部状态</option>
+              <option value="pending">pending</option>
+              <option value="running">running</option>
+              <option value="paused">paused</option>
+              <option value="completed">completed</option>
+              <option value="skipped">skipped</option>
+              <option value="failed">failed</option>
+            </select>
+            <select id="blockSort">
+              <option value="min_time">按时间</option>
+              <option value="progress">按进度</option>
+              <option value="status">按状态</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Block</th>
+                <th>时间范围</th>
+                <th>状态</th>
+                <th class="right">Series</th>
+                <th class="right">Chunks</th>
+                <th class="right">Samples</th>
+                <th>进度</th>
+                <th class="right">跳过</th>
+                <th class="right">耗时</th>
+              </tr>
+            </thead>
+            <tbody id="blockBody"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <span id="blockPageInfo">—</span>
+          <span class="spacer"></span>
+          <button class="ghost" id="blockPrev">上一页</button>
+          <button class="ghost" id="blockNext">下一页</button>
+        </div>
+      </div>
+
+      <div class="bottom-grid">
+        <div class="section" style="margin-bottom:0">
+          <div class="section-head">
+            <h2>运行日志</h2>
+            <div class="tools">
+              <label class="faint" style="display:flex;align-items:center;gap:5px;font-size:10.5px;cursor:pointer">
+                <input type="checkbox" class="checkbox" id="logDebug"> DEBUG
+              </label>
+              <button class="ghost" id="logClear">清屏</button>
+            </div>
+          </div>
+          <div class="log-panel" style="border:0;height:300px">
+            <div class="log-body" id="logBody"></div>
+          </div>
+        </div>
+        <div class="section" style="margin-bottom:0">
+          <div class="section-head"><h2>任务配置</h2></div>
+          <div class="info-panel" style="border:0;height:300px">
+            <div class="kv"><span class="k">数据目录</span><span class="v" id="cfgDataDir">—</span></div>
+            <div class="kv"><span class="k">输出目录</span><span class="v" id="cfgOutDir">—</span></div>
+            <div class="kv"><span class="k">Sink / 压缩</span><span class="v" id="cfgSink">—</span></div>
+            <div class="kv"><span class="k">并行</span><span class="v" id="cfgParallel">—</span></div>
+            <div class="kv"><span class="k">批 / 单元</span><span class="v" id="cfgBatch">—</span></div>
+            <div class="kv"><span class="k">过滤</span><span class="v" id="cfgFilter">—</span></div>
+            <div class="kv"><span class="k">已读 / 写出</span><span class="v" id="cfgBytes">—</span></div>
+            <div class="kv"><span class="k">CRC / 解码错误</span><span class="v" id="cfgErrors">—</span></div>
+            <div class="kv"><span class="k">开始时间</span><span class="v" id="cfgStarted">—</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 新建任务 -->
+<div class="modal-mask hidden" id="newModal">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>新建迁移任务</h3>
+      <button class="ghost" data-close="newModal">关闭</button>
+    </div>
+    <div class="modal-body">
+      <div class="notice hidden" id="newNotice"></div>
+      <div class="form-grid">
+        <label>任务名称</label>
+        <input type="text" id="fName" placeholder="prod-2026-11（可留空）">
+
+        <label>数据目录</label>
+        <div class="row-2">
+          <input type="text" id="fDataDir" placeholder="/prometheus/data">
+          <button id="btnScan">扫描 Blocks</button>
+        </div>
+        <div class="hint">Prometheus data 目录或单个 Block 目录，必须位于服务端 --allow-root 下</div>
+
+        <label>Block 选择</label>
+        <div class="scan-box" id="scanBox">
+          <div class="scan-row head">
+            <span></span><span>Block</span><span>时间范围</span><span class="n">Series</span><span class="n">Chunks</span>
+          </div>
+          <div class="scan-row"><span></span><span class="u faint">扫描后显示，可全不选表示迁移全部</span><span></span><span></span><span></span></div>
+        </div>
+
+        <label>输出目录</label>
+        <input type="text" id="fOutDir" placeholder="/mnt/duckdb/export">
+
+        <label>Sink</label>
+        <div class="row-2">
+          <select id="fSink">
+            <option value="parquet">parquet（DuckDB-ready）</option>
+            <option value="duckdb">duckdb（parquet + 自动装载）</option>
+            <option value="ndjson">ndjson（调试）</option>
+          </select>
+          <select id="fCompression">
+            <option value="zstd">zstd</option>
+            <option value="snappy">snappy</option>
+            <option value="none">none</option>
+          </select>
+        </div>
+
+        <label>并行度</label>
+        <div class="row-2">
+          <input type="number" id="fBlockParallel" value="2" min="1" max="32" title="block_parallel">
+          <input type="number" id="fDecodeWorkers" value="4" min="1" max="64" title="decode_workers">
+        </div>
+        <div class="hint">block_parallel（块并行） · decode_workers（块内解码线程）</div>
+
+        <label>Batch / Unit</label>
+        <div class="row-2">
+          <input type="number" id="fBatchSamples" value="65536" min="1024" step="1024" title="batch_samples">
+          <input type="number" id="fUnitSeries" value="50000" min="1" step="1000" title="unit_series">
+        </div>
+        <div class="hint">batch_samples（每批样本数） · unit_series（checkpoint 粒度）</div>
+
+        <label>时间过滤</label>
+        <div class="row-2">
+          <input type="text" id="fMinTime" placeholder="min-time（可选，RFC3339 或 ms）">
+          <input type="text" id="fMaxTime" placeholder="max-time（可选，RFC3339 或 ms）">
+        </div>
+
+        <label>标签过滤</label>
+        <input type="text" id="fMatchers" placeholder="job=api,env=prod（精确匹配，AND，可留空）">
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="ghost" data-close="newModal">取消</button>
+      <button class="primary" id="btnCreate">创建任务</button>
+    </div>
+  </div>
+</div>
+
+<!-- Token -->
+<div class="modal-mask hidden" id="tokenModal">
+  <div class="modal" style="width:min(460px,100%)">
+    <div class="modal-head">
+      <h3>API Bearer Token</h3>
+      <button class="ghost" data-close="tokenModal">关闭</button>
+    </div>
+    <div class="modal-body">
+      <div class="faint" style="margin-bottom:8px">服务端启用鉴权时，需要输入 token。保存在浏览器 localStorage。</div>
+      <div class="token-box">
+        <input type="text" id="tokenInput" placeholder="粘贴 token">
+        <button class="primary" id="tokenSave">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
+</body>
+</html>
