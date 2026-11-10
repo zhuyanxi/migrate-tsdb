@@ -25,12 +25,34 @@ pub trait BatchSink: Send {
     fn end_block(&mut self) -> Result<SinkOutcome>;
 }
 
-pub fn block_output_dir(cfg: &JobConfig, block_id: &str) -> PathBuf {
-    cfg.blocks_dir().join(format!("block={block_id}"))
+pub fn block_output_dir(cfg: &JobConfig, tenant: &str, block_id: &str) -> PathBuf {
+    let base = cfg.blocks_dir();
+    if tenant.is_empty() {
+        base.join(format!("block={block_id}"))
+    } else {
+        base.join(format!("tenant={tenant}"))
+            .join(format!("block={block_id}"))
+    }
 }
 
-pub fn create_sink(cfg: &JobConfig, block_id: &str, worker: usize) -> Result<Box<dyn BatchSink>> {
-    let dir = block_output_dir(cfg, block_id);
+/// Output directory for a block, used by verify/UI-independent tools.
+pub fn output_dir_for(out_dir: &Path, tenant: Option<&str>, block_id: &str) -> PathBuf {
+    let base = out_dir.join("blocks");
+    match tenant {
+        Some(t) if !t.is_empty() => base
+            .join(format!("tenant={t}"))
+            .join(format!("block={block_id}")),
+        _ => base.join(format!("block={block_id}")),
+    }
+}
+
+pub fn create_sink(
+    cfg: &JobConfig,
+    tenant: &str,
+    block_id: &str,
+    worker: usize,
+) -> Result<Box<dyn BatchSink>> {
+    let dir = block_output_dir(cfg, tenant, block_id);
     match cfg.sink.kind {
         SinkKind::Parquet | SinkKind::Duckdb => Ok(Box::new(parquet::ParquetSink::new(
             dir,
@@ -57,8 +79,8 @@ pub fn dir_size(dir: &Path) -> u64 {
     total
 }
 
-pub fn remove_block_output(cfg: &JobConfig, block_id: &str) -> Result<()> {
-    let dir = block_output_dir(cfg, block_id);
+pub fn remove_block_output(cfg: &JobConfig, tenant: &str, block_id: &str) -> Result<()> {
+    let dir = block_output_dir(cfg, tenant, block_id);
     if dir.exists() {
         std::fs::remove_dir_all(&dir)?;
     }

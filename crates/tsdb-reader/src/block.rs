@@ -62,6 +62,8 @@ impl BlockReader {
             .unwrap_or(0);
         let info = BlockInfo {
             path: path.to_path_buf(),
+            tenant: String::new(),
+            remote: false,
             meta,
             index_bytes,
             chunks_bytes: chunks.bytes(),

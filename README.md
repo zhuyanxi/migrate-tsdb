@@ -1,14 +1,15 @@
 # tsdb-migrate
 
-把 Prometheus TSDB Block 中的海量历史样本，以**有界内存、可暂停/恢复、不重不漏**的方式迁移到 Parquet / DuckDB。Rust 实现，不依赖 Go runtime，不构建 Prometheus 查询引擎。
+把 Prometheus TSDB Block / Grafana Mimir 对象存储中的海量历史样本，以**有界内存、可暂停/恢复、不重不漏**的方式迁移到 Parquet / DuckDB。Rust 实现，不依赖 Go runtime，不构建 Prometheus 查询引擎。
 
 ```
-Prometheus Blocks ──▶ tsdb-reader ──▶ migrate-core ──▶ Parquet (Hive 分区) ──▶ DuckDB
-                         │                 │
-                    index/chunks/      pipeline / checkpoint / sink
-                    tombstones
-                         │
-              CLI  ◀─────┴─────▶ HTTP API + Web 控制台
+Prometheus Blocks ─┐
+                   ├─▶ tsdb-reader ──▶ migrate-core ──▶ Parquet (Hive 分区) ──▶ DuckDB
+Mimir S3 (tenant) ─┘        │                 │
+  tenant 发现          index/chunks/     pipeline / checkpoint / sink
+  按块下载 cache        tombstones
+                              │
+                   CLI  ◀─────┴─────▶ HTTP API + Web 控制台
 ```
 
 ## 特性
@@ -16,6 +17,7 @@ Prometheus Blocks ──▶ tsdb-reader ──▶ migrate-core ──▶ Parquet
 - **零拷贝读取**：mmap index 与 chunk segment；只建立 `symbols/32` 的偏移表，不把全部 label 字符串放内存。
 - **全编码支持**：XOR、XOR2、Histogram、FloatHistogram、HistogramST、FloatHistogramST。
 - **Tombstones 感知**：按 series ref + 闭区间过滤，不导出已删除样本。
+- **Grafana Mimir 数据源**：自动发现 `<bucket>/<prefix>/<tenant>/<ULID>`，支持 AWS S3 / MinIO / 本地目录模拟；tenant 隔离输出与 checkpoint。
 - **有界内存流水线**：Block 级并行 × 块内解码线程，背压 + 批量 + 单元屏障；内存与数据总量无关。
 - **断点续传**：单元级 checkpoint + 确定性 part 文件名，恢复时清理未提交尾部，part 粒度不重不漏。
 - **三种交付形态**：本地 CLI、可部署 HTTP API、内嵌 Web 控制台（启动/暂停/恢复/停止 + 详细进度）。
@@ -46,6 +48,26 @@ cargo build --release
 
 中断后再次执行同一条 `migrate` 命令即可续跑（默认 `resume=true`）；已完成块会跳过。
 
+### Mimir（S3）
+
+```bash
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
+
+# 发现 tenant
+./target/release/tsdb-migrate inspect --mimir-bucket bucketA --mimir-prefix mimir
+
+# 迁指定 tenant（省略 --mimir-tenant 表示全部）
+./target/release/tsdb-migrate migrate \
+  --mimir-bucket bucketA --mimir-prefix mimir --mimir-tenant tenant-a \
+  --out /mnt/export --block-parallel 2 --decode-workers 4
+
+# MinIO / 本地镜像
+./target/release/tsdb-migrate migrate --mimir-bucket mimir-blocks \
+  --mimir-endpoint http://127.0.0.1:9000 --mimir-allow-http --mimir-path-style \
+  --out /mnt/export
+./target/release/tsdb-migrate migrate --mimir-local-root /mnt/mimir-mirror --out /mnt/export
+```
+
 ### Server + Web
 
 ```bash
@@ -64,24 +86,29 @@ TSDB_MIGRATE_TOKEN=change-me ./target/release/tsdb-migrate-server \
 <out>/
 ├── manifest.json
 ├── load_duckdb.sql
-├── .state/blocks/<ULID>.json          # checkpoint
-└── blocks/block=<ULID>/
-    ├── _complete.json
-    ├── series/part-u000000-w00.parquet
-    ├── samples/part-u000000-w00.parquet
-    └── histograms/part-u000000-w00.parquet
+├── .state/blocks/<ULID>.json          # 本地源 checkpoint
+├── .state/blocks/<tenant>/<ULID>.json # Mimir 源 checkpoint
+├── .cache/                            # Mimir 下载缓存（完成后默认清理）
+└── blocks/
+    ├── block=<ULID>/                  # 本地源
+    │   ├── _complete.json
+    │   └── {series,samples,histograms}/part-*.parquet
+    └── tenant=<tenant>/block=<ULID>/  # Mimir 源
+        ├── _complete.json
+        └── {series,samples,histograms}/part-*.parquet
 ```
 
 | 表 | 列 |
 |----|----|
-| `series` | `series_uid, series_ref, labels MAP, block` |
-| `samples` | `series_uid, ts, value, block` |
-| `histograms` | `series_uid, ts, st, count, zero_count, sum, schema, zero_threshold, pos_spans, neg_spans, pos_buckets, neg_buckets, custom_values, reset_hint, block` |
+| `series` | `series_uid, series_ref, labels MAP, block`（Mimir 输出额外带 Hive `tenant`） |
+| `samples` | `series_uid, ts, value, block`（Mimir 输出额外带 Hive `tenant`） |
+| `histograms` | `series_uid, ts, st, count, zero_count, sum, schema, zero_threshold, pos_spans, neg_spans, pos_buckets, neg_buckets, custom_values, reset_hint, block`（同上） |
 
 ```sql
 SELECT labels['__name__'], count(*)
 FROM samples s JOIN series x USING (series_uid)
 WHERE s.block = x.block
+  AND s.tenant IS NOT DISTINCT FROM x.tenant
 GROUP BY 1 ORDER BY 2 DESC;
 ```
 
@@ -93,8 +120,9 @@ GROUP BY 1 ORDER BY 2 DESC;
 | [docs/01-roadmap.md](docs/01-roadmap.md) | 分阶段方案、交付物、验收标准与状态 |
 | [docs/02-format-notes.md](docs/02-format-notes.md) | Index/Chunks/Tombstones/ChunkEnc 字段级说明与踩坑 |
 | [docs/03-api.md](docs/03-api.md) | HTTP API 契约、状态机、错误码 |
-| [docs/04-operations.md](docs/04-operations.md) | 部署、调参、DuckDB、故障恢复、监控 |
+| [docs/04-operations.md](docs/04-operations.md) | 部署、调参、DuckDB、Mimir 接入、故障恢复、监控 |
 | [docs/05-verification.md](docs/05-verification.md) | 对拍、端到端、断点续传、性能实测与已知限制 |
+| [docs/06-mimir-source.md](docs/06-mimir-source.md) | Mimir 接入方式、对象定位规则、各层改动范围与兼容性 |
 
 ## 仓库结构
 
@@ -114,8 +142,9 @@ prometheus/              # 本项目依赖的 Prometheus 源码快照（只读�
 ## 测试
 
 ```bash
-cargo test --workspace        # 29 个测试：格式对拍、CRC、状态机、配置、路径安全
-scripts/e2e.sh                # fixture → Parquet → verify → DuckDB
+cargo test --workspace        # 30 个测试：格式对拍、CRC、状态机、配置、路径安全、Mimir 本地源
+scripts/e2e.sh                # 本地 fixture → Parquet → verify → DuckDB
+scripts/mimir-local-e2e.sh    # Mimir 布局双 tenant（同名 ULID）→ verify → DuckDB
 scripts/bench.sh gen 20000    # 生成 2000 万级样本基准块
 scripts/bench.sh              # release 吞吐/RSS
 ```
@@ -135,6 +164,7 @@ scripts/dev-fixtures.sh        # 需要 Go 1.26+
 ## 已知限制
 
 - 只读已落盘 Block；不读取 Head/WAL/`chunks_head`。
+- Mimir 支持 S3 / MinIO / 本地目录模拟；不做远程 range 读取，按块下载到本地 cache。
 - 不解析 postings；标签过滤在 series 遍历时进行。
 - 不做跨块去重；输出保留 `block` 分区，重叠块会在 `inspect` 中告警。
 - 单线程 chunk 吞吐约 45 MB/s，未达 100 MB/s 目标（多块并发约 113 MB/s）；详见验证报告。

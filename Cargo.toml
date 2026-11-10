@@ -19,6 +19,8 @@ thiserror = "2"
 memmap2 = "0.9"
 crc32c = "0.6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+object_store = { version = "0.14", features = ["aws"] }
+futures = "0.3"
 crossbeam-channel = "0.5"
 arrow-array = "60.1"
 arrow-schema = "60.1"
@@ -26,7 +28,7 @@ parquet = { version = "60.1", features = ["arrow", "zstd", "snap"] }
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "fs", "io-util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

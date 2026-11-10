@@ -111,7 +111,74 @@ GET /api/blocks?data_dir=<path>&scan=<bool>&limit=<n>
 }
 ```
 
-### 4.3 任务列表
+#### Mimir 数据源示例
+
+`data_dir` 与 `mimir` 二选一：
+
+```json
+{
+  "name": "mimir-prod",
+  "output_dir": "/mnt/duckdb/mimir",
+  "mimir": {
+    "backend": "s3",
+    "bucket": "bucketA",
+    "prefix": "mimir",
+    "region": "us-east-1",
+    "endpoint": "",
+    "tenants": ["tenant-a", "tenant-b"],
+    "cache_dir": "",
+    "keep_cache": false,
+    "max_concurrent_downloads": 8,
+    "allow_http": false,
+    "force_path_style": false
+  },
+  "filter": {"min_time": null, "max_time": null, "matchers": []},
+  "sink": {"kind": "parquet", "compression": "zstd"},
+  "options": {"block_parallel": 2, "decode_workers": 4, "unit_series": 50000}
+}
+```
+
+- `backend`: `s3` | `local`。`local` 时 `bucket` 是服务端可见的目录路径（用于测试/离线镜像），同样必须位于 `--allow-root` 下。
+- `tenants` 为空表示迁移该 bucket/prefix 下发现的全部 tenant。
+- S3 凭证只从服务端环境变量读取（`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION`），不会出现在 API 请求或 job 状态中。
+- `cache_dir` 为空时使用 `<output_dir>/.cache`；建议与输出同盘，至少预留 `block_parallel × 单块大小` 空间。
+
+### 4.3 Mimir Tenant 发现
+
+```
+POST /api/mimir/tenants
+Content-Type: application/json
+```
+
+请求体就是 `mimir` 配置（`tenants` 会被忽略，始终发现全部）：
+
+```json
+{
+  "backend": "s3",
+  "bucket": "bucketA",
+  "prefix": "mimir",
+  "region": "us-east-1",
+  "endpoint": "",
+  "allow_http": false,
+  "force_path_style": false
+}
+```
+
+```json
+{
+  "elapsed_ms": 842,
+  "tenants": [
+    {"id": "tenant-a", "blocks": 128, "objects": 14208, "bytes": 7340032000},
+    {"id": "tenant-b", "blocks": 64, "objects": 7104, "bytes": 3670016000}
+  ]
+}
+```
+
+- 该接口只做对象 LIST，不下载块；用于 UI 展示/选择 tenant。
+- `local` 后端同样可用（bucket 为目录）。
+- 大 bucket 的 LIST 可能耗时数秒到数十秒，并可能产生 S3 请求费用。
+
+### 4.4 任务列表
 
 ```
 GET /api/jobs
@@ -119,7 +186,7 @@ GET /api/jobs
 
 返回 `JobSnapshot[]`，按开始时间倒序。字段见 §5.1。
 
-### 4.4 创建任务
+### 4.5 创建任务
 
 ```
 POST /api/jobs
@@ -178,7 +245,7 @@ Content-Type: application/json
 | 目录不存在 / 无 Block | 400 | `no Prometheus TSDB blocks found under ...` |
 | 输出目录被占用 | 409 | `output_dir already used by another job` |
 
-### 4.5 任务详情
+### 4.6 任务详情
 
 ```
 GET /api/jobs/{id}
@@ -186,7 +253,7 @@ GET /api/jobs/{id}
 
 返回 `JobDetail`。若任务是从磁盘恢复且尚未构建引擎，会在此请求内完成 planning + 进度回填（可能耗时数百毫秒到数秒）。
 
-### 4.6 任务动作
+### 4.7 任务动作
 
 ```
 POST /api/jobs/{id}/actions
@@ -208,7 +275,7 @@ Content-Type: application/json
 {"error":"cannot pause from state completed","status":409}
 ```
 
-### 4.7 分块进度
+### 4.8 分块进度
 
 ```
 GET /api/jobs/{id}/blocks?status=<s>&offset=<n>&limit=<n>&sort=<min_time|progress|status>
@@ -221,7 +288,9 @@ GET /api/jobs/{id}/blocks?status=<s>&offset=<n>&limit=<n>&sort=<min_time|progres
   "limit": 100,
   "blocks": [
     {
+      "key": "tenant-a/01H...",
       "ulid": "01H...",
+      "tenant": "tenant-a",
       "path": "/prometheus/data/01H...",
       "min_time": 1700000000000,
       "max_time": 1700022485001,
@@ -255,7 +324,9 @@ GET /api/jobs/{id}/blocks?status=<s>&offset=<n>&limit=<n>&sort=<min_time|progres
 
 `status`：`pending` | `running` | `paused` | `completed` | `failed` | `skipped`。
 
-### 4.8 日志
+`tenant` 对本地目录源为 `null`；Mimir 源为对应 tenant。`key` 是内部唯一键（`tenant/ulid` 或 `ulid`）。
+
+### 4.9 日志
 
 ```
 GET /api/jobs/{id}/logs?after=<seq>&limit=<n>
@@ -274,7 +345,7 @@ GET /api/jobs/{id}/logs?after=<seq>&limit=<n>
 - `after` 用于增量拉取；返回 `seq > after` 的前 `limit` 条。
 - `level`：`debug` | `info` | `warn` | `error`。
 
-### 4.9 删除任务记录
+### 4.10 删除任务记录
 
 ```
 DELETE /api/jobs/{id}
@@ -346,7 +417,7 @@ DELETE /api/jobs/{id}
 ```json
 {
   "job": { "...": "JobSnapshot" },
-  "config": { "...": "JobConfig（含 data_dir/output_dir/filter/sink/options）" },
+  "config": { "...": "JobConfig（含 data_dir 或 mimir / output_dir / filter / sink / options）" },
   "interrupted": false,
   "engine_alive": true,
   "engine_ready": true,
@@ -384,8 +455,12 @@ DELETE /api/jobs/{id}
 # 健康
 curl -s localhost:8080/api/health
 
-# 扫描
+# 扫描本地块
 curl -s "localhost:8080/api/blocks?data_dir=/prometheus/data&scan=true"
+
+# 发现 Mimir tenant
+curl -s -X POST localhost:8080/api/mimir/tenants -H 'content-type: application/json' \
+  -d '{"backend":"s3","bucket":"bucketA","prefix":"mimir","region":"us-east-1"}' 
 
 # 创建
 curl -s -X POST localhost:8080/api/jobs -H 'content-type: application/json' -d @job.json

@@ -19,9 +19,9 @@ cargo test --workspace
 | `tsdb-reader` 单元测试（varint/bstream/varbit/index/tombstones/meta） | 13 | 通过 |
 | `tsdb-reader` chunk CRC 损坏 / 跳过校验 | 2 | 通过 |
 | `tsdb-reader` 真实 Block + 6 种 chunk 编码对拍 | 2 | 通过 |
-| `migrate-core` 单元测试（状态机/配置/ETA/checkpoint/duckdb 转义） | 10 | 通过 |
+| `migrate-core` 单元测试（状态机/配置/ETA/checkpoint/duckdb 转义/Mimir 本地源） | 11 | 通过 |
 | `tsdb-migrate-server` 路径安全（允许根内 / 拒绝 `..`） | 2 | 通过 |
-| **合计** | **29** | **全部通过** |
+| **合计** | **30** | **全部通过** |
 
 ```text
 test result: ok. 10 passed; 0 failed
@@ -272,3 +272,93 @@ checkpoint: completed_unit=330
 | E6 | verify 能发现缺失 | ✅ 行数不一致返回码 3 |
 
 > E1/E2/E4 未达到“漂亮数字”的原因已在表中说明。不修改验收口径：在真实服务器上应重新测量并更新本表。
+
+
+---
+
+## 10. Grafana Mimir 对象存储数据源
+
+### 10.1 本地 bucket 模拟（多 tenant / 同名 ULID）
+
+测试布局：
+
+```
+/tmp/mimir-bucket/
+  tenant-a/<ULID>/{meta.json,index,tombstones,chunks/000001}
+  tenant-b/<ULID>/{meta.json,index,tombstones,chunks/000001}
+```
+
+两个 tenant 使用**完全相同的 ULID**，验证 tenant 隔离：
+
+| 步骤 | 结果 |
+|------|------|
+| `inspect --mimir-local-root` | 识别 tenant-a / tenant-b，各 1 block / 4 objects / 18.9 KiB |
+| `plan` | 2 blocks / 84 series / 200 chunks / 9902 samples |
+| `migrate` | `samples=9820`（2 × 4910），tombstone 82 |
+| 输出路径 | `blocks/tenant=tenant-a/block=<ULID>/` 与 `tenant-b/...` 并存 |
+| checkpoint | `.state/blocks/tenant-a/<ULID>.json` 与 `tenant-b/<ULID>.json` 分开 |
+| `verify` | 两个块 `completed`，各 42 series / 4790 samples / 120 hist，`verify OK` |
+
+DuckDB：
+
+```sql
+SELECT tenant, count(*) FROM read_parquet('.../blocks/**/samples/*.parquet', hive_partitioning=true) GROUP BY 1;
+-- tenant-a | 4790
+-- tenant-b | 4790
+```
+
+### 10.2 Mimir 断点续传（2 × 20002 series）
+
+- bucket 内两个 tenant 各放一份 20002 series / 240060 chunks 的块。
+- 迁移中 `kill -9`，两个 tenant 的 checkpoint 分别记录 `completed_unit=6 / series_done=3500`。
+- 恢复：
+
+```text
+清理 4 个未提交 part 文件（每个 tenant）
+从 checkpoint 恢复，已完成 7 个单元，offset=857184
+最终 samples=57,630,924（2 × 28,815,462）
+```
+
+| 运行方式 | 每个 tenant 的 parquet samples 行数 |
+|----------|-----------------------------------|
+| 一次跑完 | 28,815,342 |
+| 中断后续跑 | **28,815,342** |
+
+`verify OK`；DuckDB：
+
+```sql
+SELECT tenant, count(*) FROM samples GROUP BY 1;
+-- tenant-a | 28815342
+-- tenant-b | 28815342
+```
+
+### 10.3 API / Web
+
+| 项 | 结果 |
+|----|------|
+| `POST /api/mimir/tenants`（local bucket） | 返回 tenant-a/tenant-b，各 1 block / 4 objects / 19308 bytes |
+| `POST /api/jobs` 带 `mimir.tenants=["tenant-a"]` | `created`，blocks=1，totals.tenants=1，series=42 |
+| Web 新建任务切 Mimir → 扫描 tenant → 取消 tenant-b → 创建 | 仅 tenant-a 任务，最终 4.91K samples |
+| 块表 tenant 列 | 显示 `tenant-a` |
+| 配置面板 | `Mimir local:///...`、`1 个（指定：tenant-a）` |
+| console/page error | 无 |
+
+![Mimir 新建任务](assets/ui-mimir-modal.png)
+
+![Mimir 任务详情](assets/ui-mimir-job.png)
+
+### 10.4 真实 S3
+
+- S3 客户端构建、分页 LIST、流式 GET 路径已接入 `object_store`。
+- 当前环境无 AWS 凭证/测试桶，**未做真实 S3 端到端压测**。
+- 使用伪造凭证请求 AWS 返回可读错误（`InvalidAccessKeyId`），未发生 panic；证明签名/请求链路正常。
+
+### 10.5 已知限制
+
+| 限制 | 说明 |
+|------|------|
+| 无远程 range 读取 | 整块下载到 cache；磁盘占用 = 并发块大小，完成后默认清理 |
+| 无 bucket index 解析 | 通过 LIST 发现块；超大 bucket 首次发现会较慢并产生 LIST 费用 |
+| S3 最终一致 | 刚写入的块可能对象不可见；该块失败，resume 可重试 |
+| tenant 字符集 | 限制 `[A-Za-z0-9._-]{1,128}`，避免路径/Hive 分区注入 |
+| 真实 S3 压测 | 待在有凭证的环境补测（吞吐/错误重试/限流） |

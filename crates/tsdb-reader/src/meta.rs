@@ -81,7 +81,12 @@ impl BlockMeta {
 
 #[derive(Debug, Clone)]
 pub struct BlockInfo {
+    /// Local block directory (for remote sources this is the download cache).
     pub path: PathBuf,
+    /// Mimir tenant; empty for a plain local data directory.
+    pub tenant: String,
+    /// True when the block came from an object store and was materialised locally.
+    pub remote: bool,
     pub meta: BlockMeta,
     pub index_bytes: u64,
     pub chunks_bytes: u64,
@@ -93,6 +98,23 @@ pub struct BlockInfo {
 impl BlockInfo {
     pub fn ulid(&self) -> &str {
         &self.meta.ulid
+    }
+
+    /// Stable internal key: `tenant/ulid` for Mimir, `ulid` for local blocks.
+    pub fn key(&self) -> String {
+        if self.tenant.is_empty() {
+            self.meta.ulid.clone()
+        } else {
+            format!("{}/{}", self.tenant, self.meta.ulid)
+        }
+    }
+
+    pub fn tenant_opt(&self) -> Option<&str> {
+        if self.tenant.is_empty() {
+            None
+        } else {
+            Some(&self.tenant)
+        }
     }
 
     pub fn size_bytes(&self) -> u64 {
@@ -172,6 +194,8 @@ pub fn discover_blocks(root: &Path) -> Result<Vec<BlockInfo>> {
         }
         blocks.push(BlockInfo {
             path: dir,
+            tenant: String::new(),
+            remote: false,
             meta,
             index_bytes,
             chunks_bytes,

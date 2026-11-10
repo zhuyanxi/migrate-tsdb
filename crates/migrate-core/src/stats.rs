@@ -34,7 +34,10 @@ struct BlockRuntime {
 
 #[derive(Debug)]
 pub struct BlockStats {
+    /// Internal identity: `tenant/ulid` for Mimir, `ulid` for local.
+    pub key: String,
     pub ulid: String,
+    pub tenant: Option<String>,
     pub path: String,
     pub min_time: i64,
     pub max_time: i64,
@@ -70,7 +73,9 @@ impl BlockStats {
             (p.stats.series + unit_series as u64 - 1) / unit_series as u64
         };
         Self {
+            key: p.info.key(),
             ulid: p.info.meta.ulid.clone(),
+            tenant: p.info.tenant_opt().map(str::to_string),
             path: p.info.path.display().to_string(),
             min_time: p.info.meta.min_time,
             max_time: p.info.meta.max_time,
@@ -171,7 +176,9 @@ impl BlockStats {
             _ => None,
         };
         BlockSnapshot {
+            key: self.key.clone(),
             ulid: self.ulid.clone(),
+            tenant: self.tenant.clone(),
             path: self.path.clone(),
             min_time: self.min_time,
             max_time: self.max_time,
@@ -204,6 +211,9 @@ impl BlockStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Totals {
+    /// Number of distinct Mimir tenants (0 for a local directory source).
+    #[serde(default)]
+    pub tenants: u64,
     pub series_total: u64,
     pub series_done: u64,
     pub chunks_total: u64,
@@ -244,7 +254,11 @@ struct RatePoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockSnapshot {
+    #[serde(default)]
+    pub key: String,
     pub ulid: String,
+    #[serde(default)]
+    pub tenant: Option<String>,
     pub path: String,
     pub min_time: i64,
     pub max_time: i64,
@@ -332,7 +346,11 @@ impl JobStats {
 
     pub fn totals(&self) -> Totals {
         let mut t = Totals::default();
+        let mut tenants = std::collections::BTreeSet::new();
         for b in &self.blocks {
+            if let Some(tenant) = &b.tenant {
+                tenants.insert(tenant.clone());
+            }
             t.series_total += b.series_total;
             t.series_done += b.series_done.load(Ordering::Relaxed);
             t.chunks_total += b.chunks_total;
@@ -352,6 +370,7 @@ impl JobStats {
             t.unknown_encodings += b.unknown_encodings.load(Ordering::Relaxed);
         }
         t.samples = t.floats + t.histograms;
+        t.tenants = tenants.len() as u64;
         t
     }
 
@@ -453,10 +472,10 @@ impl JobStats {
         }
     }
 
-    pub fn block_snapshot(&self, ulid: &str) -> Option<BlockSnapshot> {
+    pub fn block_snapshot(&self, key: &str) -> Option<BlockSnapshot> {
         self.blocks
             .iter()
-            .find(|b| b.ulid == ulid)
+            .find(|b| b.key == key || b.ulid == key)
             .map(|b| b.snapshot())
     }
 }

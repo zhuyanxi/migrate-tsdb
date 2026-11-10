@@ -303,6 +303,7 @@ magic 0x0130BA30 (4B BE) | flag/version (1B, 必须为 1)
 | chunk encoding 0–6 | 读取 + 对拍 | 6 种编码均有 fixture 逐样本对拍 |
 | tombstones v1 | 读取 + 对拍 | 真实 Block fixture 带删除区间 |
 | meta v1 | 读取 | 未知字段忽略 |
+| Mimir 对象布局 | 读取 | `<prefix>/<tenant>/<ULID>/...`；见 §9 |
 | Head / WAL / chunks_head | 不支持 | 需先让 Prometheus flush/compact 成 Block |
 | 远程读 / 对象存储 | 不支持 | 只读本地 Block 目录 |
 
@@ -317,3 +318,38 @@ magic 0x0130BA30 (4B BE) | flag/version (1B, 必须为 1)
 - [x] Tombstones 区间与样本过滤数量一致（41 条）。
 - [x] 损坏 CRC 返回 `Checksum` 错误（单元测试覆盖）。
 - [x] 16 字节对齐、chunk `len` 不含 encoding、tombstone CRC 范围等坑位有注释与测试。
+
+---
+
+## 9. Grafana Mimir 对象存储布局
+
+Mimir 的 block 存储使用 tenant 作为顶层前缀（`-blocks-storage.storage-prefix` 可选）：
+
+```
+s3://bucketA/
+  tenant-a/
+    01HXXXXXXXXXXXXXXXXXXXXXXX/
+      meta.json
+      index
+      tombstones
+      chunks/000001
+      chunks/000002
+    01HYYYYYYYYYYYYYYYYYYYYYYY/
+      ...
+    bucket-index.json          # 控制面文件，忽略
+    markers/                   # 忽略
+  tenant-b/
+    01HXXXXXXXXXXXXXXXXXXXXXXX/  # 允许与其他 tenant 同 ULID
+      ...
+```
+
+规则：
+
+1. **tenant 目录** = `<prefix>/` 下 delimiter listing 的 common prefix；tenant 必须匹配 `[A-Za-z0-9._-]{1,128}`（避免路径/分区注入）。
+2. **block 目录** = `<prefix>/<tenant>/<ULID>/`；ULID 为 26 位大写 Crockford Base32。`meta.json`、`index`、`chunks/*` 必须存在。
+3. **忽略**：`bucket-index.json`、`markers/`、`debug/`、非 ULID 目录。
+4. **删除标记**：block 根目录出现 `deletion-mark.json` 时视为待删除，迁移计划跳过并告警（不物理删除源对象）。
+5. **同 ULID 跨 tenant**：Mimir 允许（甚至常见于复制数据）。内部 key 使用 `tenant/ULID`，输出/checkpoint 按 tenant 分离，不能只按 ULID 去重。
+6. **对象读取**：本工具按块把 `meta.json/index/tombstones/chunks/*` 流式下载到本地 cache，再交给 mmap reader；不做远程 range 读取，因此内存不随块大小增长。
+7. **S3 凭证**：使用 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY`、`AWS_SESSION_TOKEN`、`AWS_REGION`；MinIO 通过 `endpoint` + `path-style` + `allow_http` 接入。凭证不写入 job 状态文件。
+8. **一致性**：对象存储 LIST 最终一致；迁移期间 Mimir 新写入的 block 可能出现在列表但对象未可见。下载阶段如遇缺失对象会失败该块，重试（resume）即可；不会写出半块数据（`.ready` 标记 + 失败清理）。

@@ -132,6 +132,7 @@
           <table>
             <thead>
               <tr>
+                <th>Tenant</th>
                 <th>Block</th>
                 <th>时间范围</th>
                 <th>状态</th>
@@ -172,6 +173,8 @@
         <div class="section" style="margin-bottom:0">
           <div class="section-head"><h2>任务配置</h2></div>
           <div class="info-panel" style="border:0;height:300px">
+            <div class="kv"><span class="k">数据源</span><span class="v" id="cfgSource">—</span></div>
+            <div class="kv"><span class="k">Tenant</span><span class="v" id="cfgTenants">—</span></div>
             <div class="kv"><span class="k">数据目录</span><span class="v" id="cfgDataDir">—</span></div>
             <div class="kv"><span class="k">输出目录</span><span class="v" id="cfgOutDir">—</span></div>
             <div class="kv"><span class="k">Sink / 压缩</span><span class="v" id="cfgSink">—</span></div>
@@ -201,19 +204,68 @@
         <label>任务名称</label>
         <input type="text" id="fName" placeholder="prod-2026-11（可留空）">
 
-        <label>数据目录</label>
-        <div class="row-2">
-          <input type="text" id="fDataDir" placeholder="/prometheus/data">
-          <button id="btnScan">扫描 Blocks</button>
-        </div>
-        <div class="hint">Prometheus data 目录或单个 Block 目录，必须位于服务端 --allow-root 下</div>
+        <label>数据源</label>
+        <select id="fSource">
+          <option value="local">本地 TSDB 目录（Prometheus / Mimir 下载目录）</option>
+          <option value="mimir">Grafana Mimir 对象存储（S3）</option>
+        </select>
 
-        <label>Block 选择</label>
-        <div class="scan-box" id="scanBox">
-          <div class="scan-row head">
-            <span></span><span>Block</span><span>时间范围</span><span class="n">Series</span><span class="n">Chunks</span>
+        <div class="src-local" id="localSourceFields">
+          <label>数据目录</label>
+          <div class="row-2">
+            <input type="text" id="fDataDir" placeholder="/prometheus/data">
+            <button id="btnScan">扫描 Blocks</button>
           </div>
-          <div class="scan-row"><span></span><span class="u faint">扫描后显示，可全不选表示迁移全部</span><span></span><span></span><span></span></div>
+          <div class="hint">Prometheus data 目录或单个 Block 目录，必须位于服务端 --allow-root 下</div>
+
+          <label>Block 选择</label>
+          <div class="scan-box" id="scanBox">
+            <div class="scan-row head">
+              <span></span><span>Block</span><span>时间范围</span><span class="n">Series</span><span class="n">Chunks</span>
+            </div>
+            <div class="scan-row"><span></span><span class="u faint">扫描后显示，可全不选表示迁移全部</span><span></span><span></span><span></span></div>
+          </div>
+        </div>
+
+        <div class="src-mimir hidden" id="mimirSourceFields">
+          <label>Bucket</label>
+          <div class="row-2">
+            <input type="text" id="fMimirBucket" placeholder="bucketA">
+            <select id="fMimirBackend">
+              <option value="s3">AWS S3 / S3 兼容</option>
+              <option value="local">本地目录（模拟 bucket）</option>
+            </select>
+          </div>
+          <div class="hint">Mimir 布局：<code>&lt;prefix&gt;/&lt;tenant&gt;/&lt;ULID&gt;/{meta.json,index,chunks}</code>；凭证使用服务端 AWS_* 环境变量</div>
+
+          <label>Prefix / Region</label>
+          <div class="row-2">
+            <input type="text" id="fMimirPrefix" placeholder="mimir（可留空）">
+            <input type="text" id="fMimirRegion" value="us-east-1" placeholder="us-east-1">
+          </div>
+
+          <label>Endpoint</label>
+          <div class="row-2">
+            <input type="text" id="fMimirEndpoint" placeholder="MinIO: http://127.0.0.1:9000（可留空）">
+            <input type="text" id="fMimirCache" placeholder="缓存目录（默认 &lt;out&gt;/.cache）">
+          </div>
+
+          <label>发现 Tenant</label>
+          <div class="row-2">
+            <button id="btnDiscoverTenants">扫描 Tenant</button>
+            <label class="faint" style="display:flex;align-items:center;gap:6px;font-size:11px">
+              <input type="checkbox" class="checkbox" id="fMimirKeep"> 保留块缓存
+            </label>
+          </div>
+          <div class="hint">tenant 未选择表示迁移全部；选择后可只迁指定 tenant</div>
+
+          <label>Tenant 选择</label>
+          <div class="scan-box" id="tenantBox">
+            <div class="tenant-row head">
+              <span></span><span>Tenant</span><span class="n">Blocks</span><span class="n">Objects</span><span class="n">Bytes</span>
+            </div>
+            <div class="tenant-row"><span></span><span class="u faint">点击「扫描 Tenant」发现</span><span></span><span></span><span></span></div>
+          </div>
         </div>
 
         <label>输出目录</label>

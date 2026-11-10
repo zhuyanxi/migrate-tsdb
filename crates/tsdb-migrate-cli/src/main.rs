@@ -9,10 +9,12 @@ use std::time::Duration;
 use chrono::{NaiveDate, TimeZone, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use migrate_core::config::{
-    Compression, EngineOptions, FilterConfig, JobConfig, LabelMatcher, SinkConfig, SinkKind,
+    Compression, EngineOptions, FilterConfig, JobConfig, LabelMatcher, MimirBackend, MimirConfig,
+    SinkConfig, SinkKind,
 };
 use migrate_core::control::{Control, JobState};
 use migrate_core::engine::{Engine, EventSink, LogLevel};
+use migrate_core::mimir::MimirSource;
 use migrate_core::planner;
 use migrate_core::stats::ms_to_rfc3339;
 use serde_json::json;
@@ -46,7 +48,9 @@ enum Command {
 #[derive(Args, Debug)]
 struct InspectArgs {
     #[arg(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
+    #[command(flatten)]
+    mimir: MimirArgs,
     /// Scan the index when meta.json has no stats (exact, slower).
     #[arg(long)]
     scan: bool,
@@ -57,7 +61,9 @@ struct InspectArgs {
 #[derive(Args, Debug)]
 struct PlanArgs {
     #[arg(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
+    #[command(flatten)]
+    mimir: MimirArgs,
     #[arg(long)]
     out: PathBuf,
     #[arg(long, value_delimiter = ',')]
@@ -77,7 +83,9 @@ struct PlanArgs {
 #[derive(Args, Debug, Clone)]
 struct MigrateArgs {
     #[arg(long)]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
+    #[command(flatten)]
+    mimir: MimirArgs,
     #[arg(long)]
     out: PathBuf,
     #[arg(long, value_delimiter = ',')]
@@ -143,6 +151,78 @@ enum CompressionArg {
     None,
 }
 
+#[derive(Args, Debug, Clone, Default)]
+struct MimirArgs {
+    /// S3 bucket name.
+    #[arg(long)]
+    mimir_bucket: Option<String>,
+    /// Storage prefix inside the bucket (Mimir -blocks-storage.storage-prefix).
+    #[arg(long, default_value = "")]
+    mimir_prefix: String,
+    #[arg(long, default_value = "us-east-1")]
+    mimir_region: String,
+    /// Custom S3 endpoint (MinIO / Ceph / LocalStack).
+    #[arg(long)]
+    mimir_endpoint: Option<String>,
+    /// Tenant ID to migrate; repeatable or comma separated. Empty = all.
+    #[arg(long = "mimir-tenant", value_delimiter = ',')]
+    mimir_tenants: Vec<String>,
+    /// Local cache directory (default: <out>/.cache).
+    #[arg(long)]
+    mimir_cache_dir: Option<PathBuf>,
+    #[arg(long)]
+    mimir_keep_cache: bool,
+    /// Use a local directory that mirrors the bucket layout instead of S3.
+    #[arg(long)]
+    mimir_local_root: Option<PathBuf>,
+    #[arg(long, default_value_t = 8)]
+    mimir_downloads: usize,
+    #[arg(long)]
+    mimir_allow_http: bool,
+    #[arg(long)]
+    mimir_path_style: bool,
+}
+
+impl MimirArgs {
+    fn to_config(&self) -> Result<Option<MimirConfig>, Box<dyn std::error::Error>> {
+        let (backend, bucket) = match (&self.mimir_local_root, &self.mimir_bucket) {
+            (Some(root), None) => (MimirBackend::Local, root.display().to_string()),
+            (None, Some(bucket)) => (MimirBackend::S3, bucket.clone()),
+            (Some(_), Some(_)) => {
+                return Err("use either --mimir-local-root or --mimir-bucket, not both".into())
+            }
+            (None, None) => {
+                if self.mimir_tenants.is_empty()
+                    && self.mimir_prefix.is_empty()
+                    && self.mimir_endpoint.is_none()
+                {
+                    return Ok(None);
+                }
+                return Err("--mimir-bucket or --mimir-local-root is required".into());
+            }
+        };
+        let cfg = MimirConfig {
+            backend,
+            bucket,
+            prefix: self.mimir_prefix.clone(),
+            region: self.mimir_region.clone(),
+            endpoint: self.mimir_endpoint.clone().unwrap_or_default(),
+            tenants: self.mimir_tenants.clone(),
+            cache_dir: self
+                .mimir_cache_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            keep_cache: self.mimir_keep_cache,
+            max_concurrent_downloads: self.mimir_downloads,
+            allow_http: self.mimir_allow_http,
+            force_path_style: self.mimir_path_style,
+        };
+        cfg.validate()?;
+        Ok(Some(cfg))
+    }
+}
+
 #[derive(Args, Debug)]
 struct VerifyArgs {
     #[arg(long)]
@@ -175,7 +255,16 @@ fn main() {
 }
 
 fn cmd_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let blocks = discover_blocks(&args.data_dir)?;
+    if let Some(mimir) = args.mimir.to_config()? {
+        if args.data_dir.is_some() {
+            return Err("use either --data-dir or Mimir flags, not both".into());
+        }
+        return inspect_mimir(&mimir, args.json);
+    }
+    let data_dir = args
+        .data_dir
+        .ok_or("--data-dir is required (or use --mimir-bucket / --mimir-local-root)")?;
+    let blocks = discover_blocks(&data_dir)?;
     let opts = ReaderOptions {
         verify_crc: false,
         mmap_advise: false,
@@ -238,7 +327,47 @@ fn cmd_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn inspect_mimir(mimir: &MimirConfig, as_json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let cache = std::env::temp_dir().join("tsdb-migrate-inspect");
+    let source = MimirSource::new(mimir, &cache)?;
+    let infos = source.list_tenant_infos()?;
+    if as_json {
+        let rows: Vec<_> = infos
+            .iter()
+            .map(|t| {
+                json!({
+                    "tenant": t.id,
+                    "blocks": t.blocks,
+                    "objects": t.objects,
+                    "bytes": t.bytes,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    println!(
+        "Mimir bucket={} prefix={} backend={:?}",
+        mimir.bucket,
+        mimir.normalized_prefix(),
+        mimir.backend
+    );
+    println!(
+        "\n{:<32} {:>10} {:>12} {:>12}",
+        "TENANT", "BLOCKS", "OBJECTS", "BYTES"
+    );
+    for t in &infos {
+        println!(
+            "{:<32} {:>10} {:>12} {:>12}",
+            t.id, t.blocks, t.objects, t.bytes
+        );
+    }
+    println!("\n{} tenant(s)", infos.len());
+    Ok(())
+}
+
 fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let mimir = args.mimir.to_config()?;
     let cfg = build_config(
         args.data_dir,
         args.out,
@@ -246,13 +375,17 @@ fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.min_time,
         args.max_time,
         args.matchers,
+        mimir,
         EngineOptions {
             unit_series: args.unit_series,
             ..Default::default()
         },
         SinkConfig::default(),
     )?;
-    let plan = planner::plan(&cfg)?;
+    let plan = match &cfg.mimir {
+        Some(m) => MimirSource::new(m, &cfg.output_dir)?.plan(&cfg)?,
+        None => planner::plan(&cfg)?,
+    };
     let estimate = planner::estimated_output_bytes(&plan);
     if args.json {
         let blocks: Vec<_> = plan
@@ -260,6 +393,7 @@ fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|b| {
                 json!({
+                    "tenant": b.info.tenant_opt(),
                     "ulid": b.info.meta.ulid,
                     "min_time": b.info.meta.min_time,
                     "max_time": b.info.meta.max_time,
@@ -294,8 +428,8 @@ fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
         estimate as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     println!(
-        "\n{:<28} {:>12} {:>12} {:>14} {:>10}",
-        "BLOCK", "SERIES", "CHUNKS", "SAMPLES", "UNITS"
+        "\n{:<24} {:<28} {:>12} {:>12} {:>14} {:>10}",
+        "TENANT", "BLOCK", "SERIES", "CHUNKS", "SAMPLES", "UNITS"
     );
     for b in &plan.blocks {
         let units = if b.stats.series == 0 {
@@ -304,8 +438,17 @@ fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
             (b.stats.series + cfg.options.unit_series as u64 - 1) / cfg.options.unit_series as u64
         };
         println!(
-            "{:<28} {:>12} {:>12} {:>14} {:>10}",
-            b.info.meta.ulid, b.stats.series, b.stats.chunks, b.samples_expected, units
+            "{:<24} {:<28} {:>12} {:>12} {:>14} {:>10}",
+            if b.info.tenant.is_empty() {
+                "-"
+            } else {
+                &b.info.tenant
+            },
+            b.info.meta.ulid,
+            b.stats.series,
+            b.stats.chunks,
+            b.samples_expected,
+            units
         );
     }
     for w in &plan.warnings {
@@ -346,6 +489,7 @@ fn cmd_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
         duckdb_path: args.duckdb_path.clone().unwrap_or_default(),
         duckdb_exec: !args.no_duckdb_exec,
     };
+    let mimir = args.mimir.to_config()?;
     let cfg = build_config(
         args.data_dir,
         args.out,
@@ -353,6 +497,7 @@ fn cmd_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
         args.min_time,
         args.max_time,
         args.matchers,
+        mimir,
         opts,
         sink_cfg,
     )?;
@@ -515,13 +660,15 @@ fn short_time(iso: &str) -> String {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_config(
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     out: PathBuf,
     blocks: Vec<String>,
     min_time: Option<String>,
     max_time: Option<String>,
     matchers: Vec<String>,
+    mimir: Option<MimirConfig>,
     options: EngineOptions,
     sink: SinkConfig,
 ) -> Result<JobConfig, Box<dyn std::error::Error>> {
@@ -542,10 +689,18 @@ fn build_config(
             value: value.to_string(),
         });
     }
+    if mimir.is_some() && data_dir.is_some() {
+        return Err("use either --data-dir or Mimir flags, not both".into());
+    }
+    let data_dir = data_dir.unwrap_or_default();
+    if mimir.is_none() && data_dir.as_os_str().is_empty() {
+        return Err("--data-dir is required (or use --mimir-bucket / --mimir-local-root)".into());
+    }
     let cfg = JobConfig {
         name: format!("migrate-{}", Utc::now().format("%Y%m%d-%H%M%S")),
         data_dir,
         output_dir: out,
+        mimir,
         blocks,
         filter,
         sink,
@@ -594,10 +749,8 @@ fn cmd_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut problems: Vec<String> = Vec::new();
     let mut report = Vec::new();
     for block in &manifest.blocks {
-        let dir = args
-            .out
-            .join("blocks")
-            .join(format!("block={}", block.ulid));
+        let dir =
+            migrate_core::sink::output_dir_for(&args.out, block.tenant.as_deref(), &block.ulid);
         let marker_path = dir.join("_complete.json");
         let marker: Option<serde_json::Value> = std::fs::read(&marker_path)
             .ok()
@@ -650,6 +803,7 @@ fn cmd_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         report.push(json!({
             "ulid": block.ulid,
+            "tenant": block.tenant,
             "status": block.status,
             "series": {"files": series_files, "rows": series_rows},
             "tables": tables,
@@ -671,7 +825,8 @@ fn cmd_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         for b in &report {
             println!(
-                "{} {:<10} series_rows={} samples_rows={} hists_rows={} marker={}",
+                "{:<20} {} {:<10} series_rows={} samples_rows={} hists_rows={} marker={}",
+                b["tenant"].as_str().unwrap_or("-"),
                 b["ulid"].as_str().unwrap_or(""),
                 b["status"].as_str().unwrap_or("?"),
                 b["series"]["rows"],

@@ -13,6 +13,8 @@ use crate::stats::ms_to_rfc3339;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockCheckpoint {
+    #[serde(default)]
+    pub tenant: String,
     pub block: String,
     /// Highest fully committed unit; -1 means nothing committed yet.
     pub completed_unit: i64,
@@ -30,8 +32,9 @@ pub struct BlockCheckpoint {
 }
 
 impl BlockCheckpoint {
-    pub fn empty(block: &str, start_offset: u64) -> Self {
+    pub fn empty(tenant: &str, block: &str, start_offset: u64) -> Self {
         Self {
+            tenant: tenant.to_string(),
             block: block.to_string(),
             completed_unit: -1,
             next_offset: start_offset,
@@ -52,12 +55,17 @@ impl BlockCheckpoint {
     }
 }
 
-pub fn checkpoint_path(state_dir: &Path, block: &str) -> PathBuf {
-    state_dir.join("blocks").join(format!("{block}.json"))
+pub fn checkpoint_path(state_dir: &Path, tenant: &str, block: &str) -> PathBuf {
+    let base = state_dir.join("blocks");
+    if tenant.is_empty() {
+        base.join(format!("{block}.json"))
+    } else {
+        base.join(tenant).join(format!("{block}.json"))
+    }
 }
 
-pub fn load(state_dir: &Path, block: &str) -> Result<Option<BlockCheckpoint>> {
-    let path = checkpoint_path(state_dir, block);
+pub fn load(state_dir: &Path, tenant: &str, block: &str) -> Result<Option<BlockCheckpoint>> {
+    let path = checkpoint_path(state_dir, tenant, block);
     match std::fs::read(&path) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).map_err(|e| {
             crate::Error::state(format!("parse checkpoint {}: {e}", path.display()))
@@ -68,7 +76,7 @@ pub fn load(state_dir: &Path, block: &str) -> Result<Option<BlockCheckpoint>> {
 }
 
 pub fn save(state_dir: &Path, ckpt: &BlockCheckpoint) -> Result<()> {
-    let path = checkpoint_path(state_dir, &ckpt.block);
+    let path = checkpoint_path(state_dir, &ckpt.tenant, &ckpt.block);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -84,8 +92,8 @@ pub fn save(state_dir: &Path, ckpt: &BlockCheckpoint) -> Result<()> {
     Ok(())
 }
 
-pub fn remove(state_dir: &Path, block: &str) -> Result<()> {
-    let path = checkpoint_path(state_dir, block);
+pub fn remove(state_dir: &Path, tenant: &str, block: &str) -> Result<()> {
+    let path = checkpoint_path(state_dir, tenant, block);
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

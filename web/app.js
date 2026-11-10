@@ -20,6 +20,8 @@ const S = {
   scanning: false,
   scanBlocks: [],
   selectedBlocks: new Set(),
+  tenantInfos: [],
+  selectedTenants: new Set(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -280,7 +282,7 @@ function renderDetail(d) {
     : fmtDuration(j.eta_seconds);
   $('kpiEtaSub').textContent = '已运行 ' + fmtDuration(j.elapsed_ms / 1000);
   $('kpiBlocks').textContent = `${j.blocks_completed + j.blocks_skipped} / ${j.blocks_total}`;
-  $('kpiBlocksSub').textContent = `完成 ${j.blocks_completed} · 失败 ${j.blocks_failed} · 跳过 ${j.blocks_skipped}`;
+  $('kpiBlocksSub').textContent = `完成 ${j.blocks_completed} · 失败 ${j.blocks_failed} · 跳过 ${j.blocks_skipped}` + (t.tenants ? ` · ${t.tenants} tenants` : '');
   const errs = Number(t.crc_errors || 0) + Number(t.decode_errors || 0);
   $('kpiErrors').textContent = fmtInt(errs);
   $('kpiErrorsSub').textContent = `tombstone ${fmtCompact(t.samples_skipped_tombstone)} · 范围 ${fmtCompact(t.samples_skipped_range)}`;
@@ -291,7 +293,14 @@ function renderDetail(d) {
   $('numChunks').textContent = `${fmtInt(t.chunks_done)} / ${fmtInt(t.chunks_total)}`;
   $('numSeries').textContent = `${fmtInt(t.series_done)} / ${fmtInt(t.series_total)}`;
 
-  $('cfgDataDir').textContent = j.data_dir;
+  const mcfg = d.config.mimir;
+  $('cfgSource').textContent = mcfg
+    ? `Mimir ${mcfg.backend === 'local' ? 'local' : 'S3'}://${mcfg.bucket}/${mcfg.prefix || ''}`
+    : `Local ${j.data_dir}`;
+  $('cfgTenants').textContent = mcfg
+    ? `${t.tenants || 0} 个${mcfg.tenants && mcfg.tenants.length ? '（指定：' + mcfg.tenants.join(', ') + '）' : '（全部）'}`
+    : '—';
+  $('cfgDataDir').textContent = mcfg ? (mcfg.cache_dir || '默认 <out>/.cache') : j.data_dir;
   $('cfgOutDir').textContent = j.output_dir;
   $('cfgSink').textContent = `${j.sink_kind} / ${d.config.sink.compression}`;
   $('cfgParallel').textContent = `块 ${j.options.block_parallel} · 解码 ${j.options.decode_workers}`;
@@ -347,7 +356,7 @@ function renderBlocks() {
   body.innerHTML = '';
   if (!S.blocks.length) {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td colspan="9" class="faint">暂无数据</td>';
+    tr.innerHTML = '<td colspan="10" class="faint">暂无数据</td>';
     body.appendChild(tr);
   }
   for (const b of S.blocks) {
@@ -355,6 +364,7 @@ function renderBlocks() {
     const skipped = Number(b.samples_skipped_tombstone || 0) + Number(b.samples_skipped_range || 0);
     const tr = document.createElement('tr');
     tr.innerHTML = `
+      <td class="faint">${b.tenant ? escapeHtml(b.tenant) : '—'}</td>
       <td title="${escapeHtml(b.path)}">${escapeHtml(b.ulid)}</td>
       <td class="faint">${fmtMs(b.min_time)} → ${fmtMs(b.max_time)}</td>
       <td>${statusBadge(b.status)}</td>
@@ -521,6 +531,99 @@ function syncScanAll() {
   if (all) all.checked = S.scanBlocks.length > 0 && S.selectedBlocks.size === S.scanBlocks.length;
 }
 
+function mimirMode() {
+  return $('fSource').value === 'mimir';
+}
+
+function mimirConfig() {
+  const endpoint = $('fMimirEndpoint').value.trim();
+  return {
+    backend: $('fMimirBackend').value,
+    bucket: $('fMimirBucket').value.trim(),
+    prefix: $('fMimirPrefix').value.trim(),
+    region: $('fMimirRegion').value.trim() || 'us-east-1',
+    endpoint,
+    tenants: [],
+    cache_dir: $('fMimirCache').value.trim(),
+    keep_cache: $('fMimirKeep').checked,
+    max_concurrent_downloads: 8,
+    allow_http: endpoint.startsWith('http://'),
+    force_path_style: endpoint.length > 0,
+  };
+}
+
+function toggleSource() {
+  const m = mimirMode();
+  $('localSourceFields').classList.toggle('hidden', m);
+  $('mimirSourceFields').classList.toggle('hidden', !m);
+}
+
+async function discoverTenants() {
+  const cfg = mimirConfig();
+  if (!cfg.bucket) { toast('请输入 bucket 或本地目录', true); return; }
+  $('btnDiscoverTenants').disabled = true;
+  $('btnDiscoverTenants').textContent = '扫描中…';
+  try {
+    const data = await api('/api/mimir/tenants', { method: 'POST', body: cfg });
+    S.tenantInfos = data.tenants || [];
+    S.selectedTenants = new Set(S.tenantInfos.map((t) => t.id));
+    renderTenants();
+    toast(`发现 ${S.tenantInfos.length} 个 tenant`);
+  } catch (e) {
+    S.tenantInfos = [];
+    S.selectedTenants = new Set();
+    renderTenants();
+    toast(e.message, true);
+  } finally {
+    $('btnDiscoverTenants').disabled = false;
+    $('btnDiscoverTenants').textContent = '扫描 Tenant';
+  }
+}
+
+function renderTenants() {
+  const box = $('tenantBox');
+  box.innerHTML = `
+    <div class="tenant-row head">
+      <span><input type="checkbox" class="checkbox" id="tenantAll"></span>
+      <span>Tenant</span><span class="n">Blocks</span><span class="n">Objects</span><span class="n">Bytes</span>
+    </div>`;
+  if (!S.tenantInfos.length) {
+    const d = document.createElement('div');
+    d.className = 'tenant-row';
+    d.innerHTML = '<span></span><span class="u faint">点击「扫描 Tenant」发现</span><span></span><span></span><span></span>';
+    box.appendChild(d);
+    return;
+  }
+  for (const t of S.tenantInfos) {
+    const row = document.createElement('div');
+    row.className = 'tenant-row';
+    row.innerHTML = `
+      <input type="checkbox" class="checkbox" data-tenant="${escapeHtml(t.id)}" ${S.selectedTenants.has(t.id) ? 'checked' : ''}>
+      <span class="u" title="${escapeHtml(t.id)}">${escapeHtml(t.id)}</span>
+      <span class="n">${fmtCompact(t.blocks)}</span>
+      <span class="n">${fmtCompact(t.objects)}</span>
+      <span class="n">${fmtBytes(t.bytes)}</span>`;
+    box.appendChild(row);
+  }
+  box.querySelectorAll('input[data-tenant]').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      if (cb.checked) S.selectedTenants.add(cb.dataset.tenant);
+      else S.selectedTenants.delete(cb.dataset.tenant);
+      const all = $('tenantAll');
+      if (all) all.checked = S.selectedTenants.size === S.tenantInfos.length;
+    });
+  });
+  const all = $('tenantAll');
+  if (all) {
+    all.checked = S.selectedTenants.size === S.tenantInfos.length && S.tenantInfos.length > 0;
+    all.addEventListener('change', () => {
+      if (all.checked) S.selectedTenants = new Set(S.tenantInfos.map((t) => t.id));
+      else S.selectedTenants.clear();
+      renderTenants();
+    });
+  }
+}
+
 function parseMatchers(text) {
   const out = [];
   for (const part of (text || '').split(',')) {
@@ -534,9 +637,11 @@ function parseMatchers(text) {
 }
 
 async function createJob() {
+  const m = mimirMode();
   const dataDir = $('fDataDir').value.trim();
   const outDir = $('fOutDir').value.trim();
-  if (!dataDir) { toast('请输入数据目录', true); return; }
+  if (!m && !dataDir) { toast('请输入数据目录', true); return; }
+  if (m && !$('fMimirBucket').value.trim()) { toast('请输入 bucket 或本地目录', true); return; }
   if (!outDir) { toast('请输入输出目录', true); return; }
   const minText = $('fMinTime').value.trim();
   const maxText = $('fMaxTime').value.trim();
@@ -552,11 +657,17 @@ async function createJob() {
     return;
   }
   const allSelected = S.scanBlocks.length > 0 && S.selectedBlocks.size === S.scanBlocks.length;
+  const mimir = m ? mimirConfig() : null;
+  if (mimir) {
+    mimir.tenants = S.selectedTenants.size === S.tenantInfos.length ? [] : Array.from(S.selectedTenants);
+    if (S.tenantInfos.length > 0 && S.selectedTenants.size === 0) mimir.tenants = [];
+  }
   const body = {
     name: $('fName').value.trim() || null,
-    data_dir: dataDir,
+    data_dir: m ? null : dataDir,
     output_dir: outDir,
-    blocks: allSelected || S.selectedBlocks.size === 0 ? [] : Array.from(S.selectedBlocks),
+    mimir,
+    blocks: m || allSelected || S.selectedBlocks.size === 0 ? [] : Array.from(S.selectedBlocks),
     filter,
     sink: {
       kind: $('fSink').value,
@@ -650,7 +761,9 @@ function bind() {
     $('newNotice').classList.add('hidden');
     openModal('newModal');
   });
+  $('fSource').addEventListener('change', toggleSource);
   $('btnScan').addEventListener('click', scanBlocks);
+  $('btnDiscoverTenants').addEventListener('click', discoverTenants);
   $('btnCreate').addEventListener('click', createJob);
   $('tokenBtn').addEventListener('click', openToken);
   $('tokenSave').addEventListener('click', saveToken);

@@ -213,12 +213,20 @@ RSS ≈ 基础 80MiB
 <out>/
 ├── manifest.json
 ├── load_duckdb.sql
-├── .state/blocks/<ULID>.json          # checkpoint
-└── blocks/block=<ULID>/
-    ├── _complete.json
-    ├── series/part-u000000-w00.parquet
-    ├── samples/part-u000000-w00.parquet
-    └── histograms/part-u000000-w00.parquet
+├── .cache/                            # Mimir 下载缓存（完成后默认清理）
+├── .state/blocks/<ULID>.json          # 本地源 checkpoint
+├── .state/blocks/<tenant>/<ULID>.json # Mimir 源 checkpoint
+└── blocks/
+    ├── block=<ULID>/                  # 本地目录源
+    │   ├── _complete.json
+    │   ├── series/part-u000000-w00.parquet
+    │   ├── samples/part-u000000-w00.parquet
+    │   └── histograms/part-u000000-w00.parquet
+    └── tenant=<tenant>/block=<ULID>/  # Mimir 源（Hive 分区）
+        ├── _complete.json
+        ├── series/...
+        ├── samples/...
+        └── histograms/...
 ```
 
 ### 5.1 装载
@@ -240,6 +248,7 @@ FROM samples s
 JOIN series x USING (series_uid)
 WHERE x.labels['__name__'] = 'http_requests_total'
   AND s.block = x.block
+  AND s.tenant IS NOT DISTINCT FROM x.tenant
 GROUP BY 1;
 
 -- 每秒聚合
@@ -284,7 +293,7 @@ SELECT DISTINCT series_uid, ts, value FROM samples;
 
 ### 6.2 已完成块
 
-- `blocks/block=<ULID>/_complete.json` 是完成标记；默认跳过。
+- `blocks/[tenant=<tenant>/]block=<ULID>/_complete.json` 是完成标记；默认跳过。
 - `--force` / API 新建任务并指定同一输出目录（需先删除旧任务记录）可重迁。
 - 删除任务记录不会删除输出数据。
 
@@ -312,7 +321,97 @@ SELECT DISTINCT series_uid, ts, value FROM samples;
 
 ---
 
-## 7. 监控
+## 7. Grafana Mimir 对象存储数据源
+
+### 7.1 布局与 tenant 规则
+
+```
+s3://<bucket>/<storage-prefix>/<tenant>/<ULID>/{meta.json,index,tombstones,chunks/...}
+```
+
+- tenant 是 bucket/prefix 下的第一级目录；同一 ULID 可以出现在多个 tenant。
+- 迁移输出为 `blocks/tenant=<tenant>/block=<ULID>/...`，DuckDB 自动多出 `tenant` Hive 列。
+- checkpoint 为 `.state/blocks/<tenant>/<ULID>.json`，不同 tenant 互不覆盖。
+- `bucket-index.json`、`markers/`、`debug/` 等控制面对象会被忽略；`deletion-mark.json` 标记的块跳过。
+
+### 7.2 CLI
+
+```bash
+# 发现 tenant
+tsdb-migrate inspect --mimir-bucket bucketA --mimir-prefix mimir --mimir-region us-east-1
+
+# 迁指定 tenant（可重复 / 逗号分隔）
+tsdb-migrate migrate   --mimir-bucket bucketA --mimir-prefix mimir --mimir-region us-east-1   --mimir-tenant tenant-a --mimir-tenant tenant-b   --out /mnt/export --block-parallel 2 --decode-workers 4
+
+# 迁全部 tenant（省略 --mimir-tenant）
+tsdb-migrate migrate --mimir-bucket bucketA --mimir-prefix mimir --out /mnt/export
+
+# MinIO / S3 兼容
+tsdb-migrate migrate   --mimir-bucket mimir-blocks   --mimir-endpoint http://127.0.0.1:9000   --mimir-allow-http --mimir-path-style   --out /mnt/export
+
+# 本地目录模拟 bucket（离线测试 / NFS 镜像）
+tsdb-migrate migrate --mimir-local-root /mnt/mimir-mirror --out /mnt/export
+```
+
+凭证：
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...      # 可选
+export AWS_REGION=us-east-1
+```
+
+凭证不会写入任务状态；服务端/CLI 进程需要能读取上述环境变量。
+
+最小 IAM 权限（bucket `bucketA`，prefix `mimir/`）：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::bucketA",
+      "Condition": {"StringLike": {"s3:prefix": ["mimir/*"]}}
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::bucketA/mimir/*"
+    }
+  ]
+}
+```
+
+### 7.3 缓存与资源
+
+- 每个并发 block 会下载一个完整 block 到 `<out>/.cache/<tenant>/<ULID>/`，完成后默认删除。
+- 磁盘预留 ≥ `block_parallel × 最大块大小`；典型 2h block 几十 MB~数 GB。
+- `--mimir-keep-cache` 保留缓存，便于重跑/调试；会持续占用磁盘。
+- 下载并发由 `--mimir-downloads`（默认 8）控制，受 `block_parallel` 限制。
+- 对象存储延迟高时，可适当提高 `max_concurrent_downloads`；内存不随下载并发线性增长（流式写盘）。
+
+### 7.4 API / Web
+
+- `POST /api/mimir/tenants` 发现 tenant（只 LIST，不下载）。
+- Web 新建任务选择「Grafana Mimir 对象存储（S3）」→ 填 bucket/prefix/region/endpoint → 扫描 tenant → 勾选 → 创建。
+- 任务详情按块展示 tenant；配置面板显示 bucket/prefix 与实际 tenant 过滤。
+
+### 7.5 DuckDB
+
+```sql
+-- tenant 来自 Hive 分区
+SELECT tenant, count(*) FROM samples GROUP BY 1 ORDER BY 1;
+SELECT labels['__name__'], count(*) FROM series WHERE tenant='tenant-a' GROUP BY 1;
+```
+
+### 7.6 一致性
+
+对象存储 LIST 是最终一致的；迁移期间 Mimir 可能刚写完块但对象尚不可读。下载失败会使该块失败，重新执行同一任务（resume）会从 checkpoint 继续；未完成的缓存目录不会被视为有效块。
+
+## 8. 监控
 
 - `GET /api/health`：服务存活、任务计数。
 - `GET /api/jobs/:id`：进度、速率、ETA、错误。
@@ -331,7 +430,7 @@ SELECT DISTINCT series_uid, ts, value FROM samples;
 
 ---
 
-## 8. Prometheus 侧准备
+## 9. Prometheus 侧准备
 
 1. 确认目标数据已经落成 Block（`data/<ULID>/`），而不是只在 head/WAL。
 2. 建议先完成 compaction，减少重叠块与碎片。

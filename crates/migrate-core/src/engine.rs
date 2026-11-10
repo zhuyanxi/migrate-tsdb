@@ -21,6 +21,7 @@ use crate::config::{EngineOptions, FilterConfig, JobConfig, SinkKind};
 use crate::control::{Control, JobState};
 use crate::error::{Error, Result};
 use crate::manifest;
+use crate::mimir::MimirSource;
 use crate::planner::{self, Plan, PlannedBlock};
 use crate::sink::{self, BatchSink};
 use crate::stats::{ms_to_rfc3339, BlockStats, JobStats, Totals};
@@ -57,6 +58,8 @@ pub struct Engine {
     pub stats: Arc<JobStats>,
     pub control: Arc<Control>,
     events: Arc<dyn EventSink>,
+    /// Present when the job reads from a Mimir/object-store source.
+    pub mimir: Option<Arc<MimirSource>>,
 }
 
 impl Engine {
@@ -73,7 +76,14 @@ impl Engine {
         started_ms: Option<i64>,
     ) -> Result<Self> {
         cfg.validate()?;
-        let plan = planner::plan(&cfg)?;
+        let mimir = match &cfg.mimir {
+            Some(m) => Some(Arc::new(MimirSource::new(m, &cfg.output_dir)?)),
+            None => None,
+        };
+        let plan = match &mimir {
+            Some(source) => source.plan(&cfg)?,
+            None => planner::plan(&cfg)?,
+        };
         let stats = Arc::new(JobStats::new(job_id, cfg.clone(), &plan.blocks, started_ms));
         for w in &plan.warnings {
             events.log(LogLevel::Warn, w);
@@ -99,6 +109,7 @@ impl Engine {
             stats,
             control,
             events,
+            mimir,
         })
     }
 
@@ -107,7 +118,8 @@ impl Engine {
     /// console shows the real position before the user resumes.
     pub fn hydrate_progress(&self) -> Result<()> {
         for b in &self.stats.blocks {
-            let out_dir = sink::block_output_dir(&self.cfg, &b.ulid);
+            let tenant = b.tenant.as_deref().unwrap_or("");
+            let out_dir = sink::block_output_dir(&self.cfg, tenant, &b.ulid);
             let marker = out_dir.join("_complete.json");
             if marker.exists() {
                 if let Ok(bytes) = std::fs::read(&marker) {
@@ -132,7 +144,7 @@ impl Engine {
                     }
                 }
             }
-            if let Some(ckpt) = checkpoint::load(&self.cfg.state_dir(), &b.ulid)? {
+            if let Some(ckpt) = checkpoint::load(&self.cfg.state_dir(), tenant, &b.ulid)? {
                 b.restore(
                     ckpt.series_done,
                     ckpt.chunks_done,
@@ -308,14 +320,16 @@ impl Engine {
 
     fn process_block(&self, planned: PlannedBlock) -> Result<BlockOutcome> {
         let block_id = planned.info.meta.ulid.clone();
+        let tenant = planned.info.tenant.clone();
+        let block_key = planned.info.key();
         let block_stats = self
             .stats
             .blocks
             .iter()
-            .find(|b| b.ulid == block_id)
-            .ok_or_else(|| Error::state(format!("block {block_id} missing from job stats")))?
+            .find(|b| b.key == block_key)
+            .ok_or_else(|| Error::state(format!("block {block_key} missing from job stats")))?
             .clone();
-        let out_dir = sink::block_output_dir(&self.cfg, &block_id);
+        let out_dir = sink::block_output_dir(&self.cfg, &tenant, &block_id);
         let marker_path = out_dir.join("_complete.json");
 
         if marker_path.exists() {
@@ -324,8 +338,8 @@ impl Engine {
                     LogLevel::Info,
                     &format!("block {block_id}: 强制重迁，清理已有输出"),
                 );
-                sink::remove_block_output(&self.cfg, &block_id)?;
-                checkpoint::remove(&self.cfg.state_dir(), &block_id)?;
+                sink::remove_block_output(&self.cfg, &tenant, &block_id)?;
+                checkpoint::remove(&self.cfg.state_dir(), &tenant, &block_id)?;
             } else {
                 if let Ok(bytes) = std::fs::read(&marker_path) {
                     if let Ok(m) = serde_json::from_slice::<BlockComplete>(&bytes) {
@@ -351,21 +365,43 @@ impl Engine {
                 return Ok(BlockOutcome::Skipped);
             }
         } else if self.cfg.options.force || !self.cfg.options.resume {
-            sink::remove_block_output(&self.cfg, &block_id)?;
-            checkpoint::remove(&self.cfg.state_dir(), &block_id)?;
+            sink::remove_block_output(&self.cfg, &tenant, &block_id)?;
+            checkpoint::remove(&self.cfg.state_dir(), &tenant, &block_id)?;
         }
 
         block_stats.set_status(crate::stats::BlockStatus::Running);
         self.events.log(
             LogLevel::Info,
             &format!(
-                "block {block_id}: 开始（series={} chunks={} 时间=[{},{}]）",
+                "block {}: 开始（tenant={} series={} chunks={} 时间=[{},{}]）",
+                block_id,
+                if tenant.is_empty() { "-" } else { &tenant },
                 block_stats.series_total,
                 block_stats.chunks_total,
                 block_stats.min_time,
                 block_stats.max_time
             ),
         );
+
+        if let Some(source) = &self.mimir {
+            let t0 = std::time::Instant::now();
+            self.events.log(
+                LogLevel::Info,
+                &format!("block {block_id}: 从对象存储拉取到本地缓存（tenant={tenant}）"),
+            );
+            if let Err(e) = source.materialize(&tenant, &block_id) {
+                block_stats.set_error(e.to_string());
+                block_stats.set_status(crate::stats::BlockStatus::Failed);
+                return Err(e);
+            }
+            self.events.log(
+                LogLevel::Debug,
+                &format!(
+                    "block {block_id}: 下载完成，用时 {:.2}s",
+                    t0.elapsed().as_secs_f64()
+                ),
+            );
+        }
 
         let reader = match BlockReader::open_info(
             planned.info.clone(),
@@ -384,10 +420,10 @@ impl Engine {
 
         let series_start = reader.index().series_start();
         let ckpt = if self.cfg.options.resume {
-            checkpoint::load(&self.cfg.state_dir(), &block_id)?
-                .unwrap_or_else(|| BlockCheckpoint::empty(&block_id, series_start))
+            checkpoint::load(&self.cfg.state_dir(), &tenant, &block_id)?
+                .unwrap_or_else(|| BlockCheckpoint::empty(&tenant, &block_id, series_start))
         } else {
-            BlockCheckpoint::empty(&block_id, series_start)
+            BlockCheckpoint::empty(&tenant, &block_id, series_start)
         };
         let mut start_offset = ckpt.next_offset;
         if start_offset == 0 {
@@ -426,6 +462,9 @@ impl Engine {
             if s.series == 0 {
                 block_stats.set_status(crate::stats::BlockStatus::Completed);
                 write_complete_marker(&out_dir, &block_stats, 0, 0)?;
+                if let Some(source) = &self.mimir {
+                    let _ = source.cleanup(&tenant, &block_id);
+                }
                 return Ok(BlockOutcome::Completed);
             }
             // plan should have caught this; keep going with live progress only.
@@ -480,6 +519,14 @@ impl Engine {
                     self.control.state(),
                     self.plan.warnings.clone(),
                 );
+                if let Some(source) = &self.mimir {
+                    if let Err(e) = source.cleanup(&tenant, &block_id) {
+                        self.events.log(
+                            LogLevel::Warn,
+                            &format!("block {block_id}: 清理本地缓存失败：{e}"),
+                        );
+                    }
+                }
                 Ok(BlockOutcome::Completed)
             }
             PipelineOutcome::Stopped => {
@@ -499,6 +546,7 @@ impl Engine {
         start_unit: u64,
     ) -> Result<PipelineOutcome> {
         let n = self.cfg.options.decode_workers.max(1);
+        let tenant = block_stats.tenant.clone().unwrap_or_default();
         let capacity = (self.cfg.options.channel_capacity / n).max(1);
         let mut job_txs = Vec::with_capacity(n);
         let mut job_rxs = Vec::with_capacity(n);
@@ -554,8 +602,9 @@ impl Engine {
                 let stats = block_stats.clone();
                 let events = self.events.clone();
                 let block_id = block_id.clone();
+                let tenant = tenant.clone();
                 scope.spawn(move || {
-                    let sink = match sink::create_sink(&cfg, &block_id, worker) {
+                    let sink = match sink::create_sink(&cfg, &tenant, &block_id, worker) {
                         Ok(s) => s,
                         Err(e) => {
                             abort.store(true, Ordering::SeqCst);
@@ -1140,6 +1189,7 @@ fn coordinator_loop(
 
 fn commit_unit(cfg: &JobConfig, stats: &BlockStats, unit: u64, end_offset: u64) -> Result<()> {
     let ckpt = BlockCheckpoint {
+        tenant: stats.tenant.clone().unwrap_or_default(),
         block: stats.ulid.clone(),
         completed_unit: unit as i64,
         next_offset: end_offset,

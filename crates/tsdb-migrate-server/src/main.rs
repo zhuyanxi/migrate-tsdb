@@ -141,6 +141,7 @@ async fn main() {
     let mut app = Router::new()
         .route("/api/health", get(api::health))
         .route("/api/blocks", get(api::list_blocks))
+        .route("/api/mimir/tenants", post(api::mimir_tenants))
         .route("/api/jobs", get(api::list_jobs).post(api::create_job))
         .route("/api/jobs/{id}", get(api::get_job).delete(api::delete_job))
         .route("/api/jobs/{id}/actions", post(api::job_action))

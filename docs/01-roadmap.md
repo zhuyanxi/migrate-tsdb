@@ -16,6 +16,7 @@
 | P3 | HTTP API 服务 | `crates/tsdb-migrate-server`、状态持久化、控制接口 | 已完成 |
 | P4 | Web 控制台 | `web/*`、内嵌静态资源、端到端操作 | 已完成 |
 | P5 | 性能/稳定性验收 | 基准数据、`docs/05-verification.md`、运维手册 | 完成（E1 未达标，见验证报告） |
+| P6 | Mimir 对象存储数据源 | tenant 感知的 S3 接入、本地模拟、CLI/API/Web、验证 | 已完成（真实 S3 待补测） |
 
 > 状态在实现完成后回填；若某项未达成，保持“进行中”并记录阻塞原因，不虚报。
 
@@ -186,3 +187,35 @@ tsdb-migrate migrate --data-dir <dir> --out <dir> \
 | Parquet 小文件过多 | 查询变慢 | 按 unit 合并写入；`--unit-series` 调大；文档给出 compact 建议 |
 | 直方图精度 | count 用 f64 | 记录限制；>2^53 的计数属于异常场景 |
 | 路径安全 | 服务器被滥用 | canonicalize + allow-root 白名单 + 可选 token |
+
+---
+
+## P6 — Grafana Mimir 对象存储数据源
+
+### 交付物
+
+- `crates/migrate-core/src/mimir.rs`：
+  - S3（`object_store`，兼容 MinIO/Ceph/LocalStack）与本地目录模拟两种后端。
+  - tenant 发现（delimiter listing）、对象清单流式分组、`meta.json` 并发读取。
+  - 按块流式下载到本地 cache（并发可配、`.ready` 标记、失败清理、完成后按配置清理）。
+- tenant 感知的核心链路：
+  - block 内部 key = `tenant/ulid`；
+  - 输出路径 `blocks/tenant=<tenant>/block=<ULID>/...`（本地目录源保持原路径）；
+  - checkpoint `state/blocks/<tenant>/<ULID>.json`；
+  - `BlockSnapshot`/manifest 增加 tenant；DuckDB Hive 分区自动带 `tenant` 列。
+- CLI：`--mimir-bucket / --mimir-prefix / --mimir-region / --mimir-endpoint / --mimir-tenant / --mimir-local-root / --mimir-cache-dir / --mimir-keep-cache`。
+- API：`POST /api/mimir/tenants`；`POST /api/jobs` 支持 `mimir` 配置与 `tenants` 选择。
+- Web：数据源切换、tenant 扫描/勾选、tenant 列与配置展示。
+
+### 验收标准与结果
+
+| # | 验收项 | 结果 |
+|---|--------|------|
+| F1 | 解析 Mimir 布局并识别 tenant | ✅ 本地模拟 bucket 识别 tenant-a/b |
+| F2 | 多 tenant 同名 ULID 不冲突 | ✅ 输出/checkpoint 按 tenant 分开 |
+| F3 | tenant 过滤 | ✅ API 创建仅 tenant-a，samples=4910 |
+| F4 | 对象下载缓存与清理 | ✅ 下载/`.ready`/完成后清理 |
+| F5 | 断点续传覆盖 Mimir | ✅ 2 × 28,815,342 行与一次跑完一致 |
+| F6 | CLI/API/Web 入口 | ✅ 见 `docs/05-verification.md` §10 |
+| F7 | 真实 AWS S3 | ⏳ 代码路径已接入，当前环境无凭证/桶，未做真实桶压测 |
+| F8 | DuckDB tenant 分区 | ✅ `select tenant,count(*)` 正确 |

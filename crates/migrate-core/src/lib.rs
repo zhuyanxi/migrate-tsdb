@@ -9,6 +9,7 @@ pub mod duckdb;
 pub mod engine;
 pub mod error;
 pub mod manifest;
+pub mod mimir;
 pub mod planner;
 pub mod sink;
 pub mod stats;
@@ -19,4 +20,5 @@ pub use config::{
 pub use control::{Control, JobState};
 pub use engine::{Engine, EventSink, LogLevel, NoopEvents, RunReport};
 pub use error::{Error, Result};
+pub use mimir::{MimirSource, TenantInfo};
 pub use stats::{BlockSnapshot, JobSnapshot, JobStats, Totals};

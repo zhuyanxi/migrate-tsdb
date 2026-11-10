@@ -24,6 +24,7 @@
 
 - 不实现 PromQL、Postings 倒排查询、Compaction、规则/告警。
 - 不读取 Head / WAL / `chunks_head`（只处理已落盘的 Block 目录；文档说明如何先 flush/compact）。
+- Mimir 只做**块存储导出**：不访问 querier / ingester / compactor API，不读取 Mimir 的 bucket index、删除标记之外的控制面数据。
 - 不做去重（同一 series 跨多个 Block 的重叠由上层按 `block` 分区与时间过滤处理；重叠块会在 inspect 中告警）。
 - 不追求字节级“断点续传”：checkpoint 粒度为迁移单元（默认 5 万 series / 数百万样本），恢复会重做当前未提交单元。
 
@@ -63,6 +64,13 @@
 │                      Prometheus TSDB Block 目录                             │
 │  <data-dir>/<ULID>/{meta.json,index,tombstones,chunks/000001...}           │
 └────────────────────────────────────────────────────────────────────────────┘
+                ▲
+                │ 本地 Block / 已下载缓存
+┌───────────────┴────────────────────────────────────────────────────────────┐
+│            Grafana Mimir 对象存储（S3 / MinIO / 本地模拟）                   │
+│  <prefix>/<tenant>/<ULID>/{meta.json,index,tombstones,chunks/...}          │
+│  tenant 发现 · 对象清单分组 · 按块流式下载 · 本地 cache                     │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.1 为什么是三层而不是一个单体
@@ -74,6 +82,16 @@
 ---
 
 ## 3. 组件职责边界
+
+### 3.0 数据源层（migrate-core::mimir）
+
+| 模块 | 职责 | 明确不负责 |
+|------|------|-----------|
+| `MimirConfig` | bucket / prefix / region / endpoint / tenant 过滤 / cache 配置 | 不保存密钥；凭证走 AWS 环境变量 |
+| tenant 发现 | 对 `<prefix>/` 做 delimiter listing，得到 tenant 目录 | 不解析 bucket index |
+| 对象清单 | 流式遍历 `<prefix>/<tenant>/`，按 `ULID` 分组，累计 index/chunks 大小 | 不把全部对象键常驻内存 |
+| block 下载 | 按块并发流式下载到 `<cache>/<tenant>/<ULID>`，`.ready` 标记 | 不做 range 级远程读取 |
+| 生命周期 | 完成后清理缓存（可配置保留） | 不删除源对象 |
 
 ### 3.1 tsdb-reader
 
@@ -122,8 +140,9 @@
 ### 4.1 迁移主流程
 
 ```
-scan blocks
+scan blocks（本地目录 / Mimir tenant 发现）
    → plan (series_total / chunks_total / samples_expected)
+   → [Mimir] 按块下载到本地 cache（流式、有界并发、.ready 标记）
    → for each block (block_parallel):
         open block (mmap index + segments, load tombstones)
         reader thread: series_iter(start_offset)
@@ -184,6 +203,7 @@ scan blocks
 | 每 worker Batch | ≤ 32 MiB 或 64K 样本 | 与 worker 数线性 |
 | Parquet writer | 每 worker 一个 row group 缓冲 | 与 batch 同量级 |
 | Tombstones | 每块删除区间数 | 通常 KB~MB |
+| Mimir 下载缓存 | 每并发块一个 block 目录（磁盘） | 默认完成后删除；`keep_cache` 可保留 |
 
 对比 Go 方案：没有 GC 扫描大堆、没有 `labels.Labels` 对象图、没有 `SeriesSet` 全量物化。mmap 的常驻页由内核管理，可通过 `madvise(DONTNEED)` 在块结束时主动释放。
 
@@ -197,29 +217,36 @@ scan blocks
 <out>/
 ├── manifest.json
 ├── load_duckdb.sql
+├── .cache/                              # Mimir 下载缓存（完成后默认清理）
 └── blocks/
-    └── block=<ULID>/
-        ├── series/part-u000000-w00.parquet
-        ├── samples/part-u000000-w00.parquet
-        └── histograms/part-u000000-w00.parquet
+    ├── block=<ULID>/                    # 本地目录源
+    │   ├── series/part-u000000-w00.parquet
+    │   ├── samples/part-u000000-w00.parquet
+    │   └── histograms/part-u000000-w00.parquet
+    └── tenant=<tenant>/block=<ULID>/    # Mimir 源（Hive 分区）
+        ├── series/...
+        ├── samples/...
+        └── histograms/...
 ```
 
 | 表 | 列 | 说明 |
 |----|----|------|
-| series | `series_uid UInt64`, `series_ref UInt64`, `labels Map<Utf8,Utf8>` | `series_uid = xxh3(canonical(labels))`，跨块稳定，可直接 join |
+| series | `series_uid UInt64`, `series_ref UInt64`, `labels Map<Utf8,Utf8>` | `series_uid = xxh3(canonical(labels))`，跨块稳定；Mimir 下同一组 label 在不同 tenant 的 uid 相同，join 需同时带 `tenant` + `block` |
 | samples | `series_uid UInt64`, `ts Int64`, `value Float64` | StaleNaN 原样保留（`math.Float64bits == 0x7ff0000000000002`） |
 | histograms | `series_uid`, `ts`, `count`, `zero_count`, `sum`, `schema`, `zero_threshold`, `pos_spans List<Struct<offset,length>>`, `neg_spans`, `pos_buckets List<Float64>`, `neg_buckets`, `reset_hint`, `st` | 桶为**绝对计数**（整数直方图已从 delta 还原） |
 
-DuckDB 装载（`load_duckdb.sql` 由工具生成）：
+DuckDB 装载（`load_duckdb.sql` 由工具生成；`**` 同时匹配本地与 Mimir 布局）：
 
 ```sql
 CREATE OR REPLACE TABLE series AS
-SELECT * FROM read_parquet('<out>/blocks/*/series/*.parquet', hive_partitioning = true);
+SELECT * FROM read_parquet('<out>/blocks/**/series/*.parquet', hive_partitioning = true);
 CREATE OR REPLACE TABLE samples AS
-SELECT * FROM read_parquet('<out>/blocks/*/samples/*.parquet', hive_partitioning = true);
+SELECT * FROM read_parquet('<out>/blocks/**/samples/*.parquet', hive_partitioning = true);
 CREATE OR REPLACE TABLE histograms AS
-SELECT * FROM read_parquet('<out>/blocks/*/histograms/*.parquet', hive_partitioning = true);
+SELECT * FROM read_parquet('<out>/blocks/**/histograms/*.parquet', hive_partitioning = true);
 ```
+
+Mimir 输出会自动多出 `tenant` Hive 列；本地输出只有 `block` 列。
 
 为什么不是直接链接 libduckdb：`duckdb` crate 会捆绑编译整套 C++ 引擎，构建时间与镜像体积巨大，且写入吞吐受单连接限制；Parquet 是 DuckDB 的原生外部格式，`read_parquet` 零拷贝列裁剪 + 谓词下推，实际查询性能更好。需要物化时一条 SQL 即可，且产物同时可被 Spark/Trino/DataFusion 使用。
 
@@ -254,6 +281,7 @@ SELECT * FROM read_parquet('<out>/blocks/*/histograms/*.parquet', hive_partition
 |--------|------|------|
 | 语言 | Rust 2021 | 无 GC、可预测内存、mmap 友好、并发安全 |
 | mmap | `memmap2` | 成熟、跨平台、支持 `advise` |
+| 对象存储 | `object_store` (aws feature) | S3/MinIO 兼容、流式 GET、分页 LIST、无需捆绑 libaws |
 | CRC32C | `crc32c` | 硬件加速，Castagnoli 多项式 |
 | 序列化 | `serde` / `serde_json` | meta.json、状态、manifest |
 | 列式 | `arrow-array` / `arrow-schema` + `parquet` | 官方 Rust 实现，DuckDB 原生兼容 |

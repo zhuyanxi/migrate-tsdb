@@ -8,10 +8,13 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use migrate_core::config::{EngineOptions, FilterConfig, JobConfig, SinkConfig};
+use migrate_core::config::{
+    EngineOptions, FilterConfig, JobConfig, MimirBackend, MimirConfig, SinkConfig,
+};
 use migrate_core::control::job_state_str;
 use migrate_core::control::JobState;
 use migrate_core::engine::EventSink;
+use migrate_core::mimir::MimirSource;
 use migrate_core::stats::block_status_str;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -197,8 +200,12 @@ pub async fn list_blocks(
 #[derive(Deserialize)]
 pub struct CreateJobRequest {
     pub name: Option<String>,
-    pub data_dir: String,
+    #[serde(default)]
+    pub data_dir: Option<String>,
     pub output_dir: String,
+    /// Mimir / object-store source; mutually exclusive with `data_dir`.
+    #[serde(default)]
+    pub mimir: Option<MimirConfig>,
     #[serde(default)]
     pub blocks: Vec<String>,
     #[serde(default)]
@@ -213,15 +220,36 @@ pub async fn create_job(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
 ) -> ApiResult<Json<JobDetail>> {
-    let data_dir = resolve_existing_dir(&req.data_dir, &state.inner.allow_roots, &state.inner.cwd)?;
     let output_dir =
         resolve_output_dir(&req.output_dir, &state.inner.allow_roots, &state.inner.cwd)?;
+    let (data_dir, mimir) = match (&req.data_dir, &req.mimir) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError::bad_request(
+                "provide either data_dir or mimir, not both",
+            ))
+        }
+        (None, None) => {
+            return Err(ApiError::bad_request(
+                "data_dir or mimir source is required",
+            ))
+        }
+        (Some(dir), None) => (
+            resolve_existing_dir(dir, &state.inner.allow_roots, &state.inner.cwd)?,
+            None,
+        ),
+        (None, Some(m)) => {
+            let mut m = m.clone();
+            prepare_mimir_config(&mut m, &state.inner.allow_roots, &state.inner.cwd, false)?;
+            (PathBuf::new(), Some(m))
+        }
+    };
     let cfg = JobConfig {
         name: req
             .name
             .unwrap_or_else(|| format!("migrate-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"))),
         data_dir,
         output_dir,
+        mimir,
         blocks: req.blocks,
         filter: req.filter,
         sink: req.sink,
@@ -467,6 +495,70 @@ pub async fn job_logs(
         "last_seq": handle.events.last_seq(),
         "entries": entries,
     })))
+}
+
+#[derive(Deserialize)]
+pub struct MimirTenantsRequest {
+    #[serde(flatten)]
+    pub mimir: MimirConfig,
+}
+
+pub async fn mimir_tenants(
+    State(state): State<AppState>,
+    Json(req): Json<MimirTenantsRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mut mimir = req.mimir;
+    mimir.tenants.clear();
+    prepare_mimir_config(&mut mimir, &state.inner.allow_roots, &state.inner.cwd, true)?;
+    let cache_root = state.inner.state_dir.join("cache");
+    let started = std::time::Instant::now();
+    let tenants = tokio::task::spawn_blocking(
+        move || -> std::result::Result<Vec<serde_json::Value>, String> {
+            let source = MimirSource::new(&mimir, &cache_root).map_err(|e| e.to_string())?;
+            let infos = source.list_tenant_infos().map_err(|e| e.to_string())?;
+            Ok(infos
+                .into_iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "blocks": t.blocks,
+                        "objects": t.objects,
+                        "bytes": t.bytes,
+                    })
+                })
+                .collect())
+        },
+    )
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(ApiError::bad_request)?;
+    Ok(Json(json!({
+        "tenants": tenants,
+        "elapsed_ms": started.elapsed().as_millis() as u64,
+    })))
+}
+
+/// Validates a Mimir config and canonicalises local paths so job state never
+/// contains a relative/escaping path.
+fn prepare_mimir_config(
+    mimir: &mut MimirConfig,
+    roots: &[PathBuf],
+    cwd: &Path,
+    discovery: bool,
+) -> ApiResult<()> {
+    mimir
+        .validate()
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if mimir.backend == MimirBackend::Local {
+        let p = resolve_existing_dir(&mimir.bucket, roots, cwd)?;
+        mimir.bucket = p.display().to_string();
+    }
+    if !mimir.cache_dir.trim().is_empty() {
+        let p = resolve_output_dir(&mimir.cache_dir, roots, cwd)?;
+        mimir.cache_dir = p.display().to_string();
+    }
+    let _ = discovery;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

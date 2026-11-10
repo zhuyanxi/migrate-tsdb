@@ -127,6 +127,138 @@ impl FilterConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MimirBackend {
+    /// AWS S3 (or an S3-compatible endpoint such as MinIO).
+    S3,
+    /// A local/NFS directory that mirrors the bucket layout (testing, air-gapped).
+    Local,
+}
+
+impl Default for MimirBackend {
+    fn default() -> Self {
+        MimirBackend::S3
+    }
+}
+
+fn default_region() -> String {
+    "us-east-1".to_string()
+}
+fn default_downloads() -> usize {
+    8
+}
+
+/// Grafana Mimir block storage on object storage.
+///
+/// Layout: `<prefix>/<tenant>/<ULID>/{meta.json,index,tombstones,chunks/...}`.
+/// Credentials are read from the standard AWS environment variables; they are
+/// deliberately not part of this structure so they never reach job state files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MimirConfig {
+    pub backend: MimirBackend,
+    /// S3 bucket name, or the bucket root path for `backend=local`.
+    pub bucket: String,
+    /// Storage prefix inside the bucket (Mimir `-blocks-storage.storage-prefix`).
+    pub prefix: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    /// Custom S3 endpoint (MinIO, Ceph, LocalStack). Empty = AWS default.
+    pub endpoint: String,
+    /// Exact tenant IDs to migrate. Empty = discover and migrate all tenants.
+    pub tenants: Vec<String>,
+    /// Local cache for downloaded blocks. Empty = `<output_dir>/.cache`.
+    pub cache_dir: String,
+    /// Keep downloaded blocks after successful migration (debug / repeat runs).
+    pub keep_cache: bool,
+    #[serde(default = "default_downloads")]
+    pub max_concurrent_downloads: usize,
+    /// Allow plain HTTP S3 endpoints (MinIO/LocalStack).
+    pub allow_http: bool,
+    /// Use path-style addressing (`endpoint/bucket/key`) instead of virtual host.
+    pub force_path_style: bool,
+}
+
+impl Default for MimirConfig {
+    fn default() -> Self {
+        Self {
+            backend: MimirBackend::S3,
+            bucket: String::new(),
+            prefix: String::new(),
+            region: default_region(),
+            endpoint: String::new(),
+            tenants: Vec::new(),
+            cache_dir: String::new(),
+            keep_cache: false,
+            max_concurrent_downloads: default_downloads(),
+            allow_http: false,
+            force_path_style: false,
+        }
+    }
+}
+
+impl MimirConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.bucket.trim().is_empty() {
+            return Err(Error::config("mimir.bucket is required"));
+        }
+        if self.backend == MimirBackend::S3 && self.bucket.contains('/') {
+            return Err(Error::config(
+                "mimir.bucket must be a bucket name (not a path) for S3",
+            ));
+        }
+        if self.max_concurrent_downloads == 0 || self.max_concurrent_downloads > 64 {
+            return Err(Error::config(
+                "mimir.max_concurrent_downloads must be in 1..=64",
+            ));
+        }
+        for t in &self.tenants {
+            if !is_valid_tenant(t) {
+                return Err(Error::config(format!(
+                    "invalid tenant ID {t:?}; allowed: [A-Za-z0-9._-]{{1,128}}"
+                )));
+            }
+        }
+        if !self.prefix.is_empty() && self.prefix.contains("..") {
+            return Err(Error::config("mimir.prefix must not contain '..'"));
+        }
+        Ok(())
+    }
+
+    /// Normalized storage prefix with exactly one trailing '/', or "".
+    pub fn normalized_prefix(&self) -> String {
+        let p = self.prefix.trim_matches('/');
+        if p.is_empty() {
+            String::new()
+        } else {
+            format!("{p}/")
+        }
+    }
+
+    pub fn cache_root(&self, output_dir: &std::path::Path) -> PathBuf {
+        if self.cache_dir.trim().is_empty() {
+            output_dir.join(".cache")
+        } else {
+            let p = PathBuf::from(self.cache_dir.trim());
+            if p.is_absolute() {
+                p
+            } else {
+                output_dir.join(p)
+            }
+        }
+    }
+}
+
+pub fn is_valid_tenant(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 128
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && t != "."
+        && t != ".."
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EngineOptions {
@@ -180,8 +312,12 @@ impl Default for EngineOptions {
 pub struct JobConfig {
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub data_dir: PathBuf,
     pub output_dir: PathBuf,
+    /// Mimir / S3 data source. When set, `data_dir` is ignored.
+    #[serde(default)]
+    pub mimir: Option<MimirConfig>,
     /// Optional block ULID allow-list.
     #[serde(default)]
     pub blocks: Vec<String>,
@@ -199,6 +335,7 @@ impl Default for JobConfig {
             name: default_name(),
             data_dir: PathBuf::new(),
             output_dir: PathBuf::new(),
+            mimir: None,
             blocks: Vec::new(),
             filter: FilterConfig::default(),
             sink: SinkConfig::default(),
@@ -209,11 +346,16 @@ impl Default for JobConfig {
 
 impl JobConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.data_dir.as_os_str().is_empty() {
-            return Err(Error::config("data_dir is required"));
-        }
         if self.output_dir.as_os_str().is_empty() {
             return Err(Error::config("output_dir is required"));
+        }
+        match &self.mimir {
+            Some(m) => m.validate()?,
+            None => {
+                if self.data_dir.as_os_str().is_empty() {
+                    return Err(Error::config("data_dir or mimir source is required"));
+                }
+            }
         }
         let o = &self.options;
         if o.block_parallel == 0 {
