@@ -7,7 +7,9 @@
 
 use std::path::Path;
 
-use memmap2::{Advice, Mmap, MmapOptions};
+#[cfg(unix)]
+use memmap2::{Advice};
+use memmap2::{Mmap, MmapOptions};
 
 use crate::error::{Error, Result};
 use crate::varint;
@@ -82,6 +84,7 @@ impl ChunkReader {
                 )));
             }
             if advise {
+                #[cfg(unix)]
                 let _ = mmap.advise(Advice::Sequential);
             }
             bytes += mmap.len() as u64;
@@ -169,6 +172,7 @@ impl ChunkReader {
 impl Drop for ChunkReader {
     fn drop(&mut self) {
         for seg in &self.segments {
+            #[cfg(unix)]
             let _ = seg.advise(Advice::Normal);
         }
     }
