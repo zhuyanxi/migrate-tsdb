@@ -32,15 +32,19 @@ print("state:", m["state"], "blocks:", len(m["blocks"]))
 PY
 
 if python3 -c "import duckdb" >/dev/null 2>&1; then
-  echo "== duckdb =="
+  echo "== duckdb metric tables =="
   python3 - "$OUT" <<'PY'
 import duckdb, sys
-root = sys.argv[1]
-c = duckdb.connect()
-c.execute(f"CREATE TABLE s AS SELECT * FROM read_parquet('{root}/blocks/*/samples/*.parquet', hive_partitioning=true)")
-c.execute(f"CREATE TABLE x AS SELECT * FROM read_parquet('{root}/blocks/*/series/*.parquet', hive_partitioning=true)")
-print("rows:", c.execute("SELECT count(*) FROM s").fetchone()[0])
-print(c.execute("SELECT x.labels['__name__'], count(*) FROM s JOIN x USING(series_uid) WHERE s.block=x.block GROUP BY 1 ORDER BY 2 DESC LIMIT 3").fetchall())
+root=sys.argv[1]
+sql=open(root + "/load_duckdb.sql").read()
+clean="\n".join(l for l in sql.splitlines() if not l.strip().startswith("--"))
+c=duckdb.connect()
+for st in [x.strip() for x in clean.split(";") if x.strip()]:
+    c.execute(st)
+print("metric tables:", len(c.execute("show tables").fetchall()))
+print("fixture_metric_00 rows:", c.execute('SELECT count(*) FROM "fixture_metric_00"').fetchone()[0])
+print("fixture_metric_00 cols:", [r[0] for r in c.execute('DESCRIBE "fixture_metric_00"').fetchall()])
+print("fixture_hist_00 rows:", c.execute('SELECT count(*) FROM "fixture_hist_00"').fetchone()[0])
 PY
 fi
 

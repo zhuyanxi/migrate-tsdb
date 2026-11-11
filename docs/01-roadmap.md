@@ -17,6 +17,7 @@
 | P4 | Web 控制台 | `web/*`、内嵌静态资源、端到端操作 | 已完成 |
 | P5 | 性能/稳定性验收 | 基准数据、`docs/05-verification.md`、运维手册 | 完成（E1 未达标，见验证报告） |
 | P6 | Mimir 对象存储数据源 | tenant 感知的 S3 接入、本地模拟、CLI/API/Web、验证 | 已完成（真实 S3 待补测） |
+| P7 | DuckDB metric 宽表 + tenant 分库 | 每 metric 一张表、label 列、Prometheus 单库 / Mimir 每 tenant 库 | 已完成 |
 
 > 状态在实现完成后回填；若某项未达成，保持“进行中”并记录阻塞原因，不虚报。
 
@@ -219,3 +220,34 @@ tsdb-migrate migrate --data-dir <dir> --out <dir> \
 | F6 | CLI/API/Web 入口 | ✅ 见 `docs/05-verification.md` §10 |
 | F7 | 真实 AWS S3 | ⏳ 代码路径已接入，当前环境无凭证/桶，未做真实桶压测 |
 | F8 | DuckDB tenant 分区 | ✅ `select tenant,count(*)` 正确 |
+
+
+---
+
+## P7 — DuckDB metric 宽表与按 tenant 分库
+
+### 交付物
+
+- `migrate-core/src/duckdb.rs` 重写：
+  - 扫描 Parquet `series`/`histograms`，得到 metric → label 集合、float/hist 标记。
+  - 一次 `COPY ... PARTITION_BY(md5(metric))` 写 staging Parquet，再逐 metric `CREATE TABLE AS SELECT`，避免 N 次全量扫描。
+  - 每 metric 一张表：表名 = metric name；label 列；`timestamp`；`value` 或直方图列。
+  - Prometheus 单实例；Mimir 每 tenant 独立实例。
+  - label 与保留列冲突时重命名为 `label_<name>`。
+- CLI `duckdb-load`：`--db`（Prometheus 文件 / Mimir 目录）、`--no-exec`、`--print-sql`。
+- Engine：Parquet sink 也生成 SQL；DuckDB sink 按 tenant 执行；失败只告警，不影响迁移结果。
+- 文档：`docs/07-duckdb-schema.md`；更新 00/03/04/05/06/README。
+
+### 验收标准与结果
+
+| # | 验收项 | 结果 |
+|---|--------|------|
+| G1 | Prometheus 单 DuckDB 实例 | ✅ `migration.duckdb` |
+| G2 | Mimir 每 tenant 独立实例 | ✅ `duckdb/tenant-a.duckdb`、`tenant-b.duckdb` |
+| G3 | 每 metric 一张表，表名 = metric name | ✅ 42 / 402 / 20002 metric 输出 |
+| G4 | label 作为列，缺失为 NULL | ✅ `fixture_metric_00` 列 = timestamp/value/instance/job/shard |
+| G5 | 每表含 timestamp | ✅ `timestamp TIMESTAMP`，`epoch_ms(ts)` |
+| G6 | 保留原导出逻辑 | ✅ Parquet / reader / checkpoint / resume / verify 不变，旧 e2e 通过 |
+| G7 | 直方图 metric | ✅ count/sum/buckets 等列，无 `value` |
+| G8 | label 列冲突 | ✅ `label_<name>` 回退（单元测试） |
+| G9 | 大 metric 数量装载性能 | ✅ 一次分区扫描 + 每 metric 小分区；20002 metric 的 SQL 生成 0.18s / 6.2MB，20k 全量 DB 执行待压测 |

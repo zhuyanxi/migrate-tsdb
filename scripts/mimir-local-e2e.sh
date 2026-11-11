@@ -31,12 +31,19 @@ echo "== output layout =="
 find "$WORK/out/blocks" -maxdepth 2 -type d | sed "s#$WORK/out/##" | sort
 
 if python3 -c "import duckdb" >/dev/null 2>&1; then
-  echo "== duckdb =="
+  echo "== duckdb per-tenant metric tables =="
   python3 - "$WORK/out" <<'PY'
-import duckdb, sys
+import duckdb, glob, sys
 root=sys.argv[1]
-c=duckdb.connect()
-print(c.execute(f"SELECT tenant, count(*) FROM read_parquet('{root}/blocks/**/samples/*.parquet', hive_partitioning=true) GROUP BY 1 ORDER BY 1").fetchall())
+for path in sorted(glob.glob(root + "/load_duckdb_*.sql")):
+    tenant=path.rsplit("load_duckdb_",1)[1][:-4]
+    sql=open(path).read()
+    clean="\n".join(l for l in sql.splitlines() if not l.strip().startswith("--"))
+    c=duckdb.connect()
+    for st in [x.strip() for x in clean.split(";") if x.strip()]:
+        c.execute(st)
+    print(tenant, "metric tables:", len(c.execute("show tables").fetchall()),
+          "fixture_metric_00:", c.execute('SELECT count(*) FROM "fixture_metric_00"').fetchone()[0])
 PY
 fi
 echo "OK: $WORK"

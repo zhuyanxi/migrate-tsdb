@@ -65,8 +65,9 @@ pub struct SinkConfig {
     pub kind: SinkKind,
     pub compression: Compression,
     pub row_group_size: usize,
-    /// Path of the DuckDB database (only for `kind = duckdb`). If empty, a
-    /// `migration.duckdb` file is created inside the output directory.
+    /// DuckDB output path. For a Prometheus source this is a `.duckdb` file
+    /// (default `<out>/migration.duckdb`). For a Mimir source it is a directory
+    /// (default `<out>/duckdb/`) containing one `<tenant>.duckdb` per tenant.
     pub duckdb_path: String,
     /// Execute the generated DuckDB load SQL with the `duckdb` CLI.
     pub duckdb_exec: bool,

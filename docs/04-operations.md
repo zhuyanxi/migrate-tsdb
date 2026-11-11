@@ -209,76 +209,101 @@ RSS ≈ 基础 80MiB
 
 ## 5. 输出与 DuckDB
 
+### 5.1 目录
+
 ```
 <out>/
 ├── manifest.json
-├── load_duckdb.sql
-├── .cache/                            # Mimir 下载缓存（完成后默认清理）
+├── .cache/                            # Mimir 下载缓存
+├── .duckdb_stage/                     # DuckDB metric 分区中间产物
+├── load_duckdb.sql                    # Prometheus
+├── load_duckdb_<tenant>.sql           # Mimir，每 tenant 一份
 ├── .state/blocks/<ULID>.json          # 本地源 checkpoint
 ├── .state/blocks/<tenant>/<ULID>.json # Mimir 源 checkpoint
+├── migration.duckdb                   # Prometheus 单实例
+├── duckdb/<tenant>.duckdb             # Mimir 每 tenant 实例
 └── blocks/
     ├── block=<ULID>/                  # 本地目录源
     │   ├── _complete.json
-    │   ├── series/part-u000000-w00.parquet
-    │   ├── samples/part-u000000-w00.parquet
-    │   └── histograms/part-u000000-w00.parquet
-    └── tenant=<tenant>/block=<ULID>/  # Mimir 源（Hive 分区）
+    │   └── {series,samples,histograms}/part-*.parquet
+    └── tenant=<tenant>/block=<ULID>/  # Mimir 源
         ├── _complete.json
-        ├── series/...
-        ├── samples/...
-        └── histograms/...
+        └── {series,samples,histograms}/part-*.parquet
 ```
 
-### 5.1 装载
+### 5.2 装载
 
 ```bash
-# 有 duckdb CLI
-duckdb /mnt/duckdb/metrics.duckdb < /mnt/export/load_duckdb.sql
-
-# 或使用工具
+# Prometheus：单 DB
 tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/metrics.duckdb
+
+# Mimir：按 tenant 生成多个 DB（--db 为目录）
+tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/
+
+# 只生成 SQL，不执行
+tsdb-migrate duckdb-load --out /mnt/export --no-exec
+
+# 直接使用 DuckDB CLI 执行（单 tenant 示例）
+duckdb /mnt/duckdb/tenant-a.duckdb < /mnt/export/load_duckdb_tenant-a.sql
 ```
 
-### 5.2 常用查询
-
-```sql
--- 某指标的全部序列
-SELECT labels, count(*) AS samples
-FROM samples s
-JOIN series x USING (series_uid)
-WHERE x.labels['__name__'] = 'http_requests_total'
-  AND s.block = x.block
-  AND s.tenant IS NOT DISTINCT FROM x.tenant
-GROUP BY 1;
-
--- 每秒聚合
-SELECT date_trunc('minute', to_timestamp(ts / 1000.0)) AS t, avg(value)
-FROM samples
-WHERE series_uid = 12345
-GROUP BY 1 ORDER BY 1;
-
--- 直方图桶展开
-SELECT ts, unnest(pos_buckets) AS bucket_count
-FROM histograms WHERE series_uid = 67890;
-
--- 跨块去重（同一 series 可能出现在多个块）
-SELECT DISTINCT series_uid, ts, value FROM samples;
-```
+- Prometheus 源：`<out>/migration.duckdb`（默认）或 `sink.duckdb_path` 指定 `.duckdb` 文件。
+- Mimir 源：`<out>/duckdb/<tenant>.duckdb`（默认）或 `sink.duckdb_path` 指定目录。
+- 每个 DB 装载前重建，避免旧 metric 表残留。
 
 ### 5.3 表结构
 
-| 表 | 列 |
-|----|----|
-| `series` | `series_uid UBIGINT, series_ref UBIGINT, labels MAP(VARCHAR,VARCHAR), block VARCHAR` |
-| `samples` | `series_uid UBIGINT, ts BIGINT, value DOUBLE, block VARCHAR` |
-| `histograms` | `series_uid, ts, st, count, zero_count, sum, schema, zero_threshold, pos_spans, neg_spans, pos_buckets, neg_buckets, custom_values, reset_hint, block` |
+每个 metric 一张表，表名即 metric name；label 列 + `timestamp` + 数据值：
 
-- `ts` 为毫秒时间戳。
-- `series_uid = xxh3_64(canonical(labels))`，跨块稳定；理论上存在 64 位碰撞，概率可忽略。
-- `count/zero_count` 用 DOUBLE 存储；超过 2^53 的整数计数会损失精度（正常业务不会出现）。
-- `reset_hint`：0 unknown / 1 not-reset / 2 reset / 3 gauge。
+```sql
+-- float metric
+CREATE TABLE "http_requests_total" (
+  "timestamp" TIMESTAMP,
+  "value"     DOUBLE,
+  "job"       VARCHAR,
+  "instance"  VARCHAR,
+  "method"    VARCHAR
+);
 
----
+-- native histogram metric
+CREATE TABLE "http_request_duration_seconds" (
+  "timestamp" TIMESTAMP,
+  "count" DOUBLE,
+  "sum" DOUBLE,
+  "zero_count" DOUBLE,
+  "schema" INTEGER,
+  "zero_threshold" DOUBLE,
+  "pos_spans" LIST<STRUCT("offset" INTEGER, "length" UINTEGER)>,
+  "neg_spans" LIST<STRUCT("offset" INTEGER, "length" UINTEGER)>,
+  "pos_buckets" LIST<DOUBLE>,
+  "neg_buckets" LIST<DOUBLE>,
+  "custom_values" LIST<DOUBLE>,
+  "reset_hint" UTINYINT,
+  "st" BIGINT,
+  "job" VARCHAR
+);
+```
+
+规则与限制见 `docs/07-duckdb-schema.md`：`__name__` 不建列、缺失 label 为 NULL、保留列冲突时 label 重命名为 `label_<name>`。
+
+### 5.4 常用查询
+
+```sql
+-- 某 metric 全部点
+SELECT * FROM "http_requests_total"
+WHERE "timestamp" >= TIMESTAMP '2026-11-01 00:00:00';
+
+-- 某 label 组合
+SELECT "timestamp", "value" FROM "http_requests_total"
+WHERE "job" = 'api' AND "instance" = 'host-1'
+ORDER BY 1;
+
+-- 直方图桶展开
+SELECT "timestamp", unnest("pos_buckets") AS bucket_count
+FROM "http_request_duration_seconds" LIMIT 10;
+
+-- Mimir：对每个 tenant 的 DB 分别执行；表名相同，互不干扰
+```
 
 ## 6. 故障恢复
 
@@ -401,10 +426,15 @@ export AWS_REGION=us-east-1
 
 ### 7.5 DuckDB
 
+每个 tenant 一个独立 DB：
+
+```bash
+duckdb /mnt/export/duckdb/tenant-a.duckdb
+```
+
 ```sql
--- tenant 来自 Hive 分区
-SELECT tenant, count(*) FROM samples GROUP BY 1 ORDER BY 1;
-SELECT labels['__name__'], count(*) FROM series WHERE tenant='tenant-a' GROUP BY 1;
+-- 该 DB 只包含 tenant-a 的 metric 表
+SELECT count(*) FROM "http_requests_total";
 ```
 
 ### 7.6 一致性

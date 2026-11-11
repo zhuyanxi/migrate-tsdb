@@ -21,7 +21,7 @@ Mimir S3 (tenant) ─┘        │                 │
 - **有界内存流水线**：Block 级并行 × 块内解码线程，背压 + 批量 + 单元屏障；内存与数据总量无关。
 - **断点续传**：单元级 checkpoint + 确定性 part 文件名，恢复时清理未提交尾部，part 粒度不重不漏。
 - **三种交付形态**：本地 CLI、可部署 HTTP API、内嵌 Web 控制台（启动/暂停/恢复/停止 + 详细进度）。
-- **DuckDB 原生**：输出 Hive 分区的三张表（series/samples/histograms），生成 `load_duckdb.sql`，可选调用 duckdb CLI 装载。
+- **DuckDB metric 宽表**：每个 metric 一张表（表名 = metric name），label 作为列，含 `timestamp`；Prometheus 单实例，Mimir 每 tenant 独立实例。
 
 ## 快速开始
 
@@ -42,8 +42,14 @@ cargo build --release
 # 校验行数
 ./target/release/tsdb-migrate verify --out /mnt/export
 
-# DuckDB 装载
+# DuckDB 装载（Prometheus：单 DB）
 ./target/release/tsdb-migrate duckdb-load --out /mnt/export --db /mnt/metrics.duckdb
+
+# DuckDB 装载（Mimir：每 tenant 一个 DB）
+./target/release/tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/
+
+# 只生成 SQL
+./target/release/tsdb-migrate duckdb-load --out /mnt/export --no-exec
 ```
 
 中断后再次执行同一条 `migrate` 命令即可续跑（默认 `resume=true`）；已完成块会跳过。
@@ -85,7 +91,11 @@ TSDB_MIGRATE_TOKEN=change-me ./target/release/tsdb-migrate-server \
 ```
 <out>/
 ├── manifest.json
-├── load_duckdb.sql
+├── load_duckdb.sql                    # Prometheus
+├── load_duckdb_<tenant>.sql           # Mimir，每 tenant 一份
+├── migration.duckdb                   # Prometheus 单实例
+├── duckdb/<tenant>.duckdb             # Mimir 每 tenant 实例
+├── .duckdb_stage/                     # metric 分区中间产物
 ├── .state/blocks/<ULID>.json          # 本地源 checkpoint
 ├── .state/blocks/<tenant>/<ULID>.json # Mimir 源 checkpoint
 ├── .cache/                            # Mimir 下载缓存（完成后默认清理）
@@ -98,19 +108,18 @@ TSDB_MIGRATE_TOKEN=change-me ./target/release/tsdb-migrate-server \
         └── {series,samples,histograms}/part-*.parquet
 ```
 
-| 表 | 列 |
-|----|----|
-| `series` | `series_uid, series_ref, labels MAP, block`（Mimir 输出额外带 Hive `tenant`） |
-| `samples` | `series_uid, ts, value, block`（Mimir 输出额外带 Hive `tenant`） |
-| `histograms` | `series_uid, ts, st, count, zero_count, sum, schema, zero_threshold, pos_spans, neg_spans, pos_buckets, neg_buckets, custom_values, reset_hint, block`（同上） |
+Parquet 中间层仍为 `series/samples/histograms` 三张表；DuckDB 最终结构为：
+
+- Prometheus：单个 `migration.duckdb`。
+- Mimir：`duckdb/<tenant>.duckdb`，每个 tenant 独立。
+- 每个 metric 一张表：`timestamp` + `value`（或直方图列）+ 该 metric 的 label 列。
 
 ```sql
-SELECT labels['__name__'], count(*)
-FROM samples s JOIN series x USING (series_uid)
-WHERE s.block = x.block
-  AND s.tenant IS NOT DISTINCT FROM x.tenant
-GROUP BY 1 ORDER BY 2 DESC;
+SELECT * FROM "http_requests_total"
+WHERE "timestamp" >= TIMESTAMP '2026-11-01 00:00:00';
 ```
+
+完整 DDL、label 冲突策略与限制见 `docs/07-duckdb-schema.md`。
 
 ## 文档
 
@@ -123,6 +132,7 @@ GROUP BY 1 ORDER BY 2 DESC;
 | [docs/04-operations.md](docs/04-operations.md) | 部署、调参、DuckDB、Mimir 接入、故障恢复、监控 |
 | [docs/05-verification.md](docs/05-verification.md) | 对拍、端到端、断点续传、性能实测与已知限制 |
 | [docs/06-mimir-source.md](docs/06-mimir-source.md) | Mimir 接入方式、对象定位规则、各层改动范围与兼容性 |
+| [docs/07-duckdb-schema.md](docs/07-duckdb-schema.md) | DuckDB metric 宽表、按 tenant 分库、DDL 与装载流程 |
 
 ## 仓库结构
 
@@ -142,7 +152,7 @@ prometheus/              # 本项目依赖的 Prometheus 源码快照（只读�
 ## 测试
 
 ```bash
-cargo test --workspace        # 30 个测试：格式对拍、CRC、状态机、配置、路径安全、Mimir 本地源
+cargo test --workspace        # 33 个测试：格式对拍、CRC、状态机、配置、路径安全、DuckDB schema、Mimir 本地源
 scripts/e2e.sh                # 本地 fixture → Parquet → verify → DuckDB
 scripts/mimir-local-e2e.sh    # Mimir 布局双 tenant（同名 ULID）→ verify → DuckDB
 scripts/bench.sh gen 20000    # 生成 2000 万级样本基准块

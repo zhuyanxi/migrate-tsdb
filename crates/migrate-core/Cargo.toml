@@ -17,4 +17,5 @@ arrow-schema.workspace = true
 parquet.workspace = true
 object_store.workspace = true
 futures.workspace = true
+md-5.workspace = true
 tokio.workspace = true

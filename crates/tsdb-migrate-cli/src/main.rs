@@ -235,8 +235,15 @@ struct VerifyArgs {
 struct DuckdbLoadArgs {
     #[arg(long)]
     out: PathBuf,
+    /// DB file for a Prometheus export, or DB directory for a multi-tenant Mimir export.
     #[arg(long)]
     db: Option<PathBuf>,
+    /// Generate SQL only; do not invoke the duckdb CLI.
+    #[arg(long)]
+    no_exec: bool,
+    /// Also print the generated SQL (can be large: one statement per metric).
+    #[arg(long)]
+    print_sql: bool,
 }
 
 fn main() {
@@ -857,10 +864,32 @@ fn cmd_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_duckdb_load(args: DuckdbLoadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let sql = migrate_core::duckdb::generate_sql(&args.out);
-    println!("{sql}");
-    let db = args.db.unwrap_or_else(|| args.out.join("migration.duckdb"));
-    migrate_core::duckdb::execute(&args.out, &db)?;
-    println!("loaded into {}", db.display());
+    let configured = args
+        .db
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let plans = migrate_core::duckdb::plan(&args.out, &configured)?;
+    for p in &plans {
+        let scope = match &p.tenant {
+            Some(t) => format!("tenant={t}"),
+            None => "prometheus".to_string(),
+        };
+        println!(
+            "[{scope}] metrics={} sql={} db={}",
+            p.metrics,
+            p.sql_path.display(),
+            p.db_path.display()
+        );
+        for w in &p.warnings {
+            println!("  ! {w}");
+        }
+        if args.print_sql {
+            println!("{}", std::fs::read_to_string(&p.sql_path)?);
+        }
+        if !args.no_exec {
+            migrate_core::duckdb::execute(p)?;
+        }
+    }
     Ok(())
 }

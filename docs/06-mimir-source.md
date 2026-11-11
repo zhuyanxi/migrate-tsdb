@@ -134,7 +134,7 @@ list_with_delimiter(<prefix>/)           → tenant 列表
 | 输出 | `migrate-core/src/sink/mod.rs` | Mimir 路径 `blocks/tenant=<t>/block=<ulid>`；本地保持 `blocks/block=<ulid>` |
 | Checkpoint | `migrate-core/src/checkpoint.rs` | `tenant` 字段；路径 `state/blocks/<tenant>/<ulid>.json`；本地路径不变 |
 | 执行 | `migrate-core/src/engine.rs` | block 开始前 `materialize`；完成后 `cleanup`；失败/暂停保留缓存 |
-| DuckDB | `migrate-core/src/duckdb.rs` | `blocks/**/<dataset>/*.parquet`，自动识别 `tenant` Hive 分区 |
+| DuckDB | `migrate-core/src/duckdb.rs` | 为每个 tenant 生成独立实例 `<out>/duckdb/<tenant>.duckdb`；每个 metric 一张宽表 |
 | CLI | `tsdb-migrate-cli/src/main.rs` | `--mimir-*` 参数；inspect/plan/migrate 支持 Mimir；verify tenant 路径 |
 | API | `tsdb-migrate-server/src/api.rs` | `/api/mimir/tenants`；create 支持 `mimir`/可选 `data_dir`；路径校验 |
 | Web | `web/*` | 数据源切换、tenant 扫描/勾选、tenant 列、配置展示 |
@@ -152,7 +152,7 @@ list_with_delimiter(<prefix>/)           → tenant 列表
 | 内部 key | `<ULID>` | `<tenant>/<ULID>` |
 | 输出 | `blocks/block=<ULID>/` | `blocks/tenant=<t>/block=<ULID>/` |
 | checkpoint | `.state/blocks/<ULID>.json` | `.state/blocks/<tenant>/<ULID>.json` |
-| DuckDB 分区 | `block` | `tenant` + `block` |
+| DuckDB | 单实例 `migration.duckdb`，每 metric 一张表 | 每 tenant 一个实例 `duckdb/<tenant>.duckdb`，每 metric 一张表 |
 | 缓存 | 无 | `<out>/.cache`，完成后清理 |
 | CLI | `--data-dir` | `--mimir-bucket` 或 `--mimir-local-root` |
 | API | `data_dir` | `mimir` |
@@ -161,6 +161,13 @@ list_with_delimiter(<prefix>/)           → tenant 列表
 本地源的路径、checkpoint、输出 schema 与之前完全一致；新增字段都是向后兼容的可选字段。
 
 ---
+
+## 4.1 DuckDB 输出
+
+- Prometheus 源：单个 `<out>/migration.duckdb`。
+- Mimir 源：每个 tenant 一个 `<out>/duckdb/<tenant>.db`（实际扩展名 `.duckdb`），表结构完全一致；tenant 之间不共享数据库。
+- 每个 metric 一张表（表名 = metric name），label 作为列，另有 `timestamp` 与 `value`（直方图为 count/sum/buckets 等）。
+- 详细表结构见 `07-duckdb-schema.md`。
 
 ## 5. 并发、内存与 IO
 

@@ -2,7 +2,6 @@
 //! pipeline, cooperative pause/stop, unit checkpoints and sinks.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -277,25 +276,47 @@ impl Engine {
         }
 
         if state == JobState::Completed && self.cfg.sink.kind != SinkKind::Ndjson {
-            if let Err(e) = crate::duckdb::write_sql(&self.cfg.output_dir) {
-                self.events
-                    .log(LogLevel::Warn, &format!("生成 DuckDB 装载 SQL 失败：{e}"));
-            }
-            if self.cfg.sink.kind == SinkKind::Duckdb && self.cfg.sink.duckdb_exec {
-                let db = if self.cfg.sink.duckdb_path.is_empty() {
-                    self.cfg.output_dir.join("migration.duckdb")
-                } else {
-                    PathBuf::from(&self.cfg.sink.duckdb_path)
-                };
-                match crate::duckdb::execute(&self.cfg.output_dir, &db) {
-                    Ok(()) => self.events.log(
-                        LogLevel::Info,
-                        &format!("DuckDB 装载完成：{}", db.display()),
-                    ),
-                    Err(e) => self
-                        .events
-                        .log(LogLevel::Warn, &format!("DuckDB 装载跳过：{e}")),
+            match crate::duckdb::plan(&self.cfg.output_dir, &self.cfg.sink.duckdb_path) {
+                Ok(plans) => {
+                    for p in &plans {
+                        let scope = match &p.tenant {
+                            Some(t) => format!("tenant {t}"),
+                            None => "Prometheus".to_string(),
+                        };
+                        self.events.log(
+                            LogLevel::Info,
+                            &format!(
+                                "DuckDB schema [{scope}]: {} metric table(s) → {}",
+                                p.metrics,
+                                p.sql_path.display()
+                            ),
+                        );
+                        if !p.warnings.is_empty() {
+                            self.events.log(
+                                LogLevel::Warn,
+                                &format!(
+                                    "DuckDB schema [{scope}]: {} label column(s) renamed due to reserved names",
+                                    p.warnings.len()
+                                ),
+                            );
+                        }
+                        if self.cfg.sink.kind == SinkKind::Duckdb && self.cfg.sink.duckdb_exec {
+                            match crate::duckdb::execute(p) {
+                                Ok(()) => self.events.log(
+                                    LogLevel::Info,
+                                    &format!("DuckDB 装载完成 [{scope}]：{}", p.db_path.display()),
+                                ),
+                                Err(e) => self.events.log(
+                                    LogLevel::Warn,
+                                    &format!("DuckDB 装载跳过 [{scope}]：{e}"),
+                                ),
+                            }
+                        }
+                    }
                 }
+                Err(e) => self
+                    .events
+                    .log(LogLevel::Warn, &format!("生成 DuckDB metric 表失败：{e}")),
             }
         }
 

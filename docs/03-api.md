@@ -231,6 +231,8 @@ Content-Type: application/json
 - `blocks` 为空表示全部块。
 - `filter.matchers` 是精确匹配，AND 关系；暂不支持正则。
 - `sink.kind`：`parquet` | `ndjson` | `duckdb`。`duckdb` = 先写 Parquet，完成后调用 `duckdb` CLI 装载。
+- `sink.duckdb_path`：Prometheus 源为 `.duckdb` 文件；Mimir 源为目录（每 tenant 一个 `<tenant>.duckdb`）。为空时使用默认路径。
+- DuckDB 最终为「每个 metric 一张表、label 作为列、包含 `timestamp`」；Prometheus 单实例、Mimir 每 tenant 独立实例。详见 `07-duckdb-schema.md`。
 - 创建时会同步执行 planning（扫描 `meta.json` / 必要时 index），返回时 `engine_ready=true`。
 - 同一个 `output_dir` 不允许被多个任务同时使用（避免 part/checkpoint 冲突）。
 

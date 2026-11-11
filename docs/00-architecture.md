@@ -211,46 +211,37 @@ scan blocks（本地目录 / Mimir tenant 发现）
 
 ## 6. 输出数据模型（Parquet / DuckDB）
 
-目录布局（Hive 分区，DuckDB 自动识别 `block` 列）：
+### 6.1 Parquet（中间产物，保持不变）
 
 ```
 <out>/
 ├── manifest.json
-├── load_duckdb.sql
-├── .cache/                              # Mimir 下载缓存（完成后默认清理）
+├── .cache/                              # Mimir 下载缓存
+├── .duckdb_stage/                       # DuckDB 装载中间分区，成功后可清空
 └── blocks/
     ├── block=<ULID>/                    # 本地目录源
-    │   ├── series/part-u000000-w00.parquet
-    │   ├── samples/part-u000000-w00.parquet
-    │   └── histograms/part-u000000-w00.parquet
-    └── tenant=<tenant>/block=<ULID>/    # Mimir 源（Hive 分区）
+    │   ├── series/part-*.parquet
+    │   ├── samples/part-*.parquet
+    │   └── histograms/part-*.parquet
+    └── tenant=<tenant>/block=<ULID>/    # Mimir 源
         ├── series/...
         ├── samples/...
         └── histograms/...
 ```
 
-| 表 | 列 | 说明 |
-|----|----|------|
-| series | `series_uid UInt64`, `series_ref UInt64`, `labels Map<Utf8,Utf8>` | `series_uid = xxh3(canonical(labels))`，跨块稳定；Mimir 下同一组 label 在不同 tenant 的 uid 相同，join 需同时带 `tenant` + `block` |
-| samples | `series_uid UInt64`, `ts Int64`, `value Float64` | StaleNaN 原样保留（`math.Float64bits == 0x7ff0000000000002`） |
-| histograms | `series_uid`, `ts`, `count`, `zero_count`, `sum`, `schema`, `zero_threshold`, `pos_spans List<Struct<offset,length>>`, `neg_spans`, `pos_buckets List<Float64>`, `neg_buckets`, `reset_hint`, `st` | 桶为**绝对计数**（整数直方图已从 delta 还原） |
+Parquet 三张表仍然是 `series(labels map)` / `samples(ts,value)` / `histograms(...)`；这一层是导出与校验的权威数据，不因 DuckDB 结构变化而改变。
 
-DuckDB 装载（`load_duckdb.sql` 由工具生成；`**` 同时匹配本地与 Mimir 布局）：
+### 6.2 DuckDB 最终结构
 
-```sql
-CREATE OR REPLACE TABLE series AS
-SELECT * FROM read_parquet('<out>/blocks/**/series/*.parquet', hive_partitioning = true);
-CREATE OR REPLACE TABLE samples AS
-SELECT * FROM read_parquet('<out>/blocks/**/samples/*.parquet', hive_partitioning = true);
-CREATE OR REPLACE TABLE histograms AS
-SELECT * FROM read_parquet('<out>/blocks/**/histograms/*.parquet', hive_partitioning = true);
-```
-
-Mimir 输出会自动多出 `tenant` Hive 列；本地输出只有 `block` 列。
-
-为什么不是直接链接 libduckdb：`duckdb` crate 会捆绑编译整套 C++ 引擎，构建时间与镜像体积巨大，且写入吞吐受单连接限制；Parquet 是 DuckDB 的原生外部格式，`read_parquet` 零拷贝列裁剪 + 谓词下推，实际查询性能更好。需要物化时一条 SQL 即可，且产物同时可被 Spark/Trino/DataFusion 使用。
-
----
+- **Prometheus/本地目录源**：单个实例 `<out>/migration.duckdb`。
+- **Mimir 源**：每个 tenant 一个实例 `<out>/duckdb/<tenant>.duckdb`。
+- **每个 metric 一张表**：表名即 metric name（双引号转义）；该 metric 所有 series 的 label 并集成为列；每行包含 `timestamp` 与数据值。
+  - float metric：`timestamp TIMESTAMP, value DOUBLE, <label columns...>`
+  - histogram metric：`timestamp` + `count/zero_count/sum/schema/zero_threshold/pos_spans/neg_spans/pos_buckets/neg_buckets/custom_values/reset_hint/st` + label 列
+  - `__name__` 不建列（即表名）
+  - 缺失 label 为 NULL；与保留列冲突的 label 重命名为 `label_<name>`
+- 装载方式：一次扫描 Parquet → 按 `md5(metric)` 分区写 staging Parquet → 每个 metric `CREATE TABLE AS SELECT`；避免 N 次全量扫描。
+- 详细规则、DDL 示例与限制见 `docs/07-duckdb-schema.md`。
 
 ## 7. 正确性保障
 

@@ -19,13 +19,14 @@ cargo test --workspace
 | `tsdb-reader` 单元测试（varint/bstream/varbit/index/tombstones/meta） | 13 | 通过 |
 | `tsdb-reader` chunk CRC 损坏 / 跳过校验 | 2 | 通过 |
 | `tsdb-reader` 真实 Block + 6 种 chunk 编码对拍 | 2 | 通过 |
-| `migrate-core` 单元测试（状态机/配置/ETA/checkpoint/duckdb 转义/Mimir 本地源） | 11 | 通过 |
+| `migrate-core` 单元测试（状态机/配置/ETA/checkpoint/DuckDB schema 与分库规则/Mimir 本地源） | 17 | 通过 |
 | `tsdb-migrate-server` 路径安全（允许根内 / 拒绝 `..`） | 2 | 通过 |
-| **合计** | **30** | **全部通过** |
+| **合计** | **36** | **全部通过** |
 
 ```text
-test result: ok. 10 passed; 0 failed
+test result: ok. 17 passed; 0 failed
 test result: ok. 13 passed; 0 failed
+test result: ok. 2 passed; 0 failed
 test result: ok. 2 passed; 0 failed
 test result: ok. 2 passed; 0 failed
 ```
@@ -97,20 +98,20 @@ series_rows=42  samples_rows=4790  hists_rows=120
 verify OK
 ```
 
-DuckDB 查询（Python 2.0）：
+DuckDB 最终表（每个 metric 一张表）：
 
 ```sql
-SELECT count(*) FROM read_parquet('/tmp/out/blocks/*/samples/*.parquet', hive_partitioning=true);
--- 4790
-SELECT count(*) FROM read_parquet('/tmp/out/blocks/*/histograms/*.parquet', hive_partitioning=true);
--- 120
-SELECT labels['__name__'], count(*), min(ts), max(ts)
-FROM samples s JOIN series x USING (series_uid)
-WHERE labels['__name__']='fixture_metric_00' GROUP BY 1;
--- fixture_metric_00 | 121 | 1700000000000 | 1700001800000
+SELECT count(*) FROM "fixture_metric_00";        -- 121
+DESCRIBE "fixture_metric_00";
+-- timestamp TIMESTAMP, value DOUBLE, instance VARCHAR, job VARCHAR, shard VARCHAR
+SELECT "timestamp", "value", "instance" FROM "fixture_metric_00" LIMIT 1;
+-- 2023-11-14 22:13:20 | 0.0 | host-00
+
+SELECT count(*) FROM "fixture_hist_00";          -- 60
+-- 列：timestamp + count/zero_count/sum/schema/... + job
 ```
 
-`series` 的 label 是 `MAP(VARCHAR,VARCHAR)`，可用 `labels['key']` 直接访问；`block` 为 Hive 分区列。
+Parquet 仍然是三张规范化表（`series/samples/histograms`），DuckDB 装载阶段把它转成 metric 宽表。
 
 ---
 
@@ -299,12 +300,13 @@ checkpoint: completed_unit=330
 | checkpoint | `.state/blocks/tenant-a/<ULID>.json` 与 `tenant-b/<ULID>.json` 分开 |
 | `verify` | 两个块 `completed`，各 42 series / 4790 samples / 120 hist，`verify OK` |
 
-DuckDB：
+DuckDB（每 tenant 一个实例）：
 
 ```sql
-SELECT tenant, count(*) FROM read_parquet('.../blocks/**/samples/*.parquet', hive_partitioning=true) GROUP BY 1;
--- tenant-a | 4790
--- tenant-b | 4790
+-- /tmp/mimir-bucket-out/duckdb/tenant-a.duckdb
+SELECT count(*) FROM "fixture_metric_00";   -- 121
+-- /tmp/mimir-bucket-out/duckdb/tenant-b.duckdb
+SELECT count(*) FROM "fixture_metric_00";   -- 121
 ```
 
 ### 10.2 Mimir 断点续传（2 × 20002 series）
@@ -324,13 +326,7 @@ SELECT tenant, count(*) FROM read_parquet('.../blocks/**/samples/*.parquet', hiv
 | 一次跑完 | 28,815,342 |
 | 中断后续跑 | **28,815,342** |
 
-`verify OK`；DuckDB：
-
-```sql
-SELECT tenant, count(*) FROM samples GROUP BY 1;
--- tenant-a | 28815342
--- tenant-b | 28815342
-```
+`verify OK`；DuckDB 为每个 tenant 独立实例（`duckdb/tenant-a.duckdb`、`duckdb/tenant-b.duckdb`），各自包含该 tenant 的 metric 表。
 
 ### 10.3 API / Web
 
@@ -362,3 +358,66 @@ SELECT tenant, count(*) FROM samples GROUP BY 1;
 | S3 最终一致 | 刚写入的块可能对象不可见；该块失败，resume 可重试 |
 | tenant 字符集 | 限制 `[A-Za-z0-9._-]{1,128}`，避免路径/Hive 分区注入 |
 | 真实 S3 压测 | 待在有凭证的环境补测（吞吐/错误重试/限流） |
+
+
+---
+
+## 11. DuckDB metric 宽表与按 tenant 分库
+
+### 11.1 Prometheus 单实例
+
+对 fixture 输出执行 `duckdb-load --no-exec` 生成的 SQL（用 Python DuckDB 2.0 执行）：
+
+| 项 | 结果 |
+|----|------|
+| metric 表数量 | 42（40 float + 2 hist） |
+| `fixture_metric_00` 行数 | 121 |
+| 列 | `timestamp TIMESTAMP`, `value DOUBLE`, `instance VARCHAR`, `job VARCHAR`, `shard VARCHAR` |
+| 首行 | `2023-11-14 22:13:20 \| 0.0 \| host-00 \| fixture \| 0` |
+| `fixture_hist_00` 行数 | 60 |
+| 直方图列 | `timestamp` + `count/zero_count/sum/schema/zero_threshold/pos_spans/neg_spans/pos_buckets/neg_buckets/custom_values/reset_hint/st` + `job` |
+| 单个 DB | `migration.duckdb` |
+
+402 metric 的基准输出：生成 **402 张表**，`fixture_metric_00` 1441 行，`fixture_hist_00` 60 行。
+
+### 11.2 Mimir 每 tenant 独立实例
+
+`/tmp/ui-mimir2`（仅 tenant-a）：
+
+| 项 | 结果 |
+|----|------|
+| DB | `<out>/duckdb/tenant-a.duckdb` |
+| SQL | `<out>/load_duckdb_tenant-a.sql` |
+| 表数量 | 42 |
+| `fixture_metric_00` | 121 行，列与 Prometheus 相同 |
+
+双 tenant 输出 `/tmp/duck-mimir-out`：
+
+| tenant | DB | SQL | metric 表 |
+|--------|----|-----|-----------|
+| tenant-a | `duckdb/tenant-a.duckdb` | `load_duckdb_tenant-a.sql` | 42 |
+| tenant-b | `duckdb/tenant-b.duckdb` | `load_duckdb_tenant-b.sql` | 42 |
+
+每个 tenant 的 DB 独立，同名 metric 表互不覆盖。
+
+### 11.3 Engine 自动装载
+
+用 CLI 兼容 shim（读取 stdin SQL、调用 Python DuckDB）验证 `--sink duckdb` 的完整执行链：
+
+| 源 | 输出 DB | 表数 | `fixture_metric_00` |
+|----|---------|------|---------------------|
+| Prometheus fixture | `migration.duckdb` | 42 | 121 |
+| Mimir tenant-a | `duckdb/tenant-a.duckdb` | 42 | 121 |
+| Mimir tenant-b | `duckdb/tenant-b.duckdb` | 42 | 121 |
+
+- 成功装载后 `.duckdb_stage/<scope>` 被清空（保留空目录）。
+- DB 在装载前删除重建，避免旧 metric 表残留。
+- 未安装 `duckdb` CLI 时任务仍为 `Completed`，SQL 正常写入，仅输出一条 `Warn`（`DuckDB 装载跳过 […]：duckdb CLI not found in PATH`），不阻塞迁移结果。
+
+### 11.4 实现要点验证
+
+- `COPY ... PARTITION_BY(metric_key)` 一次扫描后按 MD5 分区；每个 metric 表只读自己的分区，避免 N 次全量 JOIN。
+- `md5` Rust 实现与 DuckDB `md5()` 对拍（`fixture_metric_00` → `a243d64f533370f28c0625fdea762cdc`）。
+- 保留列冲突的 label 自动重命名为 `label_<name>`（单元测试覆盖）。
+- `duckdb-load --no-exec` 可只生成 SQL；`--db` 对 Mimir 多 tenant 必须是目录，单 tenant 可以是 `.duckdb` 文件。
+- Parquet 导出、checkpoint、resume、verify 均未变化，原 e2e 仍通过。

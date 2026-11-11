@@ -8,7 +8,7 @@
 use std::path::Path;
 
 #[cfg(unix)]
-use memmap2::{Advice};
+use memmap2::Advice;
 use memmap2::{Mmap, MmapOptions};
 
 use crate::error::{Error, Result};
