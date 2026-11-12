@@ -130,6 +130,10 @@ struct MigrateArgs {
     duckdb_path: Option<String>,
     #[arg(long)]
     no_duckdb_exec: bool,
+    #[arg(long, help = "Prometheus Remote Write endpoint URL")]
+    remote_write_url: Option<String>,
+    #[arg(long, default_value = "X-Scope-OrgID")]
+    remote_write_tenant_header: String,
     #[arg(long)]
     json_progress: bool,
     /// Print progress every N seconds.
@@ -142,6 +146,8 @@ enum SinkArg {
     Parquet,
     Ndjson,
     Duckdb,
+    #[value(name = "remote-write")]
+    RemoteWrite,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -469,6 +475,7 @@ fn cmd_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
         SinkArg::Parquet => SinkKind::Parquet,
         SinkArg::Ndjson => SinkKind::Ndjson,
         SinkArg::Duckdb => SinkKind::Duckdb,
+        SinkArg::RemoteWrite => SinkKind::RemoteWrite,
     };
     let compression = match args.compression {
         CompressionArg::Zstd => Compression::Zstd,
@@ -495,6 +502,8 @@ fn cmd_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
         row_group_size: args.row_group_size,
         duckdb_path: args.duckdb_path.clone().unwrap_or_default(),
         duckdb_exec: !args.no_duckdb_exec,
+        remote_write_url: args.remote_write_url.unwrap_or_default(),
+        remote_write_tenant_header: args.remote_write_tenant_header,
     };
     let mimir = args.mimir.to_config()?;
     let cfg = build_config(

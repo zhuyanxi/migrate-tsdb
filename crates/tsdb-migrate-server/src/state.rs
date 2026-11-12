@@ -299,6 +299,7 @@ fn minimal_snapshot(config: &JobConfig, id: &str, created_at: i64) -> JobSnapsho
             SinkKind::Parquet => "parquet".into(),
             SinkKind::Ndjson => "ndjson".into(),
             SinkKind::Duckdb => "duckdb".into(),
+            SinkKind::RemoteWrite => "remote_write".into(),
         },
     }
 }

@@ -421,3 +421,47 @@ SELECT count(*) FROM "fixture_metric_00";   -- 121
 - 保留列冲突的 label 自动重命名为 `label_<name>`（单元测试覆盖）。
 - `duckdb-load --no-exec` 可只生成 SQL；`--db` 对 Mimir 多 tenant 必须是目录，单 tenant 可以是 `.duckdb` 文件。
 - Parquet 导出、checkpoint、resume、verify 均未变化，原 e2e 仍通过。
+
+---
+
+## 12. Remote Write sink 审查与测试
+
+### 12.1 测试集
+
+```bash
+cargo test -p migrate-core --test remote_write_sink   # 28
+cargo test -p migrate-core --test remote_write_e2e    # 4
+cargo test -p migrate-core --lib engine::tests        # 9
+```
+
+| 测试集 | 数量 | 结果 |
+|--------|------|------|
+| `remote_write_sink`（mock 接收端，独立 protobuf schema 解码） | 28 | 通过 |
+| `remote_write_e2e`（真实 Block → 流水线 → HTTP） | 4 | 通过 |
+| `engine::tests`（block 排序/重叠/tenant 规则） | 9 | 通过 |
+| **新增合计** | **41** | **通过** |
+
+`migrate-core` 测试总数由 32 增至 **73**（lib 32 + sink 28 + e2e 4 + 其余 9）。
+
+### 12.2 实测结果
+
+真实 fixture（42 series / 100 chunks / 4910 samples）推送到本机 HTTP 接收端：
+
+| 场景 | 结果 |
+|------|------|
+| `--match __name__=fixture_metric_00 --sink remote-write` | `state=Completed`，1 个请求，121 样本，`timestamp` 严格递增 |
+| 请求头 | `Content-Encoding: snappy`、`Content-Type: application/x-protobuf`、`X-Prometheus-Remote-Write-Version: 0.1.0`、`User-Agent: tsdb-migrate/0.1.0` |
+| 请求体 | 1300 B，snappy **block** 格式（非 framed），protobuf 可被独立 schema 解码 |
+| 持续 503 | 5 次尝试后 `state=Failed`，错误含 `HTTP 503 ... after 5 attempts` |
+| 全量 block（含 native histogram） | `state=Failed`，错误含 `does not support native histogram samples` |
+| `ftp://` URL | 配置错误，退出码 1，未发出请求 |
+| 未配置 tenant（本地源） | 不发送任何 tenant 头 |
+| `--block-parallel 4` | 打印 `remote_write serializes blocks to preserve per-series timestamp order`，实际并发降为 1 |
+
+### 12.3 残留风险
+
+| 项 | 说明 |
+|----|------|
+| 跨 worker 顺序 | 现网数据无法构造「多 metric 且无 histogram」的 fixture，该路径由代码结构保证（unit 间 series 不重叠、单 series 单 worker）而未用端到端用例覆盖 |
+| exactly-once | 响应丢失或 checkpoint 前退出会重发当前批；接收端对相同 (series, ts) 幂等，但协议层面不承诺只送达一次 |
+| 重叠 block | 真实 Prometheus 目录常含不同 compaction level 的重叠 block，remote-write 会直接拒绝；需要按 block 或时间范围拆分迁移 |

@@ -342,7 +342,7 @@ tr:hover td { background: #11161c; }
 .form-grid label { color: var(--muted); font-size: 12px; }
 .form-grid .hint { grid-column: 2; color: var(--faint); font-size: 10.5px; margin-top: -4px; }
 .form-grid .hint code { font-family: var(--mono); color: var(--muted); }
-.src-local, .src-mimir { display: contents; }
+.src-local, .src-mimir, .remote-write-fields { display: contents; }
 .tenant-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) 70px 80px 90px; gap: 8px; align-items: center; padding: 5px 9px; border-bottom: 1px solid #161c23; font-size: 11px; }
 .tenant-row.head { color: var(--faint); font-size: 9.5px; letter-spacing: 0.07em; text-transform: uppercase; position: sticky; top: 0; background: #0c1015; }
 .tenant-row .n { font-family: var(--mono); text-align: right; color: var(--muted); }

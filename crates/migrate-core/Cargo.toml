@@ -15,7 +15,15 @@ chrono.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 parquet.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+snap.workspace = true
+bytes.workspace = true
 object_store.workspace = true
 futures.workspace = true
 md-5.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+prost.workspace = true
+snap.workspace = true

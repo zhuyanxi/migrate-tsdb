@@ -37,6 +37,8 @@ pub enum SinkKind {
     Parquet,
     Ndjson,
     Duckdb,
+    #[serde(rename = "remote_write")]
+    RemoteWrite,
 }
 
 impl Default for SinkKind {
@@ -71,6 +73,11 @@ pub struct SinkConfig {
     pub duckdb_path: String,
     /// Execute the generated DuckDB load SQL with the `duckdb` CLI.
     pub duckdb_exec: bool,
+    /// Full Prometheus Remote Write v1.0 endpoint URL.
+    pub remote_write_url: String,
+    /// Header used to forward Mimir tenant IDs; empty disables it.
+    #[serde(default = "default_remote_write_tenant_header")]
+    pub remote_write_tenant_header: String,
 }
 
 impl Default for SinkConfig {
@@ -81,6 +88,8 @@ impl Default for SinkConfig {
             row_group_size: default_row_group_size(),
             duckdb_path: String::new(),
             duckdb_exec: true,
+            remote_write_url: String::new(),
+            remote_write_tenant_header: default_remote_write_tenant_header(),
         }
     }
 }
@@ -145,6 +154,9 @@ impl Default for MimirBackend {
 
 fn default_region() -> String {
     "us-east-1".to_string()
+}
+fn default_remote_write_tenant_header() -> String {
+    "X-Scope-OrgID".to_string()
 }
 fn default_downloads() -> usize {
     8
@@ -380,6 +392,11 @@ impl JobConfig {
         if self.sink.row_group_size == 0 {
             return Err(Error::config("row_group_size must be >= 1"));
         }
+        if self.sink.kind == SinkKind::RemoteWrite && self.sink.remote_write_url.trim().is_empty() {
+            return Err(Error::config(
+                "sink.remote_write_url is required for remote_write",
+            ));
+        }
         if let (Some(min), Some(max)) = (self.filter.min_time, self.filter.max_time) {
             if min > max {
                 return Err(Error::config("filter.min_time > filter.max_time"));
@@ -427,5 +444,17 @@ mod tests {
         assert!(!f.accepts_ts(21));
         assert!(!f.chunk_relevant(0, 9));
         assert!(f.chunk_relevant(0, 10));
+    }
+
+    #[test]
+    fn remote_write_requires_an_endpoint() {
+        let mut c = JobConfig::default();
+        c.data_dir = "/tmp/input".into();
+        c.output_dir = "/tmp/output".into();
+        c.sink.kind = SinkKind::RemoteWrite;
+        assert!(c.validate().is_err());
+
+        c.sink.remote_write_url = "https://receiver.example/api/v1/write".to_string();
+        c.validate().unwrap();
     }
 }

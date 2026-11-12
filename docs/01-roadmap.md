@@ -251,3 +251,25 @@ tsdb-migrate migrate --data-dir <dir> --out <dir> \
 | G7 | 直方图 metric | ✅ count/sum/buckets 等列，无 `value` |
 | G8 | label 列冲突 | ✅ `label_<name>` 回退（单元测试） |
 | G9 | 大 metric 数量装载性能 | ✅ 一次分区扫描 + 每 metric 小分区；20002 metric 的 SQL 生成 0.18s / 6.2MB，20k 全量 DB 执行待压测 |
+
+---
+
+## P8：Remote Write v1.0 sink
+
+### 交付物
+
+- `migrate-core/src/sink/remote_write.rs`：snappy block + protobuf `WriteRequest`，2xx 成功、5xx/429 指数退避重试、4xx 立即失败。
+- 顺序保证：block 串行 + 按 tenant/时间排序 + 重叠范围拒绝；同 unit 内 series 跨 worker 轮转但互不重叠。
+- 配置：CLI `--sink remote-write --remote-write-url --remote-write-tenant-header`；API/Web 同名 `sink.*` 字段；Bearer token 走环境变量。
+- 文档：`docs/08-remote-write-sink.md`；更新 03/05/README。
+
+### 验收标准与结果
+
+| # | 验收项 | 结果 |
+|---|--------|------|
+| H1 | 请求符合 v1.0 头与 snappy block 编码 | ✅ 独立 protobuf schema 解码校验 |
+| H2 | 2xx 成功 / 5xx 重试 / 4xx 不重试 / 429 尊重 `Retry-After` | ✅ 28 项 sink 测试 |
+| H3 | 同 series 样本时间递增 | ✅ 请求内排序 + block/unit 顺序，端到端 121 样本严格递增 |
+| H4 | 多 tenant 不混写 | ✅ 无 tenant header 时拒绝多 tenant 计划 |
+| H5 | 真实 Block 全链路 | ✅ `remote_write_e2e` 4 项 + CLI 活体冒烟 |
+| H6 | 不影响既有链路 | ✅ Parquet/DuckDB/Mimir/verify 全量回归通过 |

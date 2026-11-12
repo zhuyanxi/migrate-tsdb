@@ -302,7 +302,11 @@ function renderDetail(d) {
     : '—';
   $('cfgDataDir').textContent = mcfg ? (mcfg.cache_dir || '默认 <out>/.cache') : j.data_dir;
   $('cfgOutDir').textContent = j.output_dir;
-  $('cfgSink').textContent = `${j.sink_kind} / ${d.config.sink.compression}`;
+  const sinkConfig = d.config.sink;
+  $('cfgSink').textContent = sinkConfig.kind === 'remote_write'
+    ? `${sinkConfig.remote_write_url} · ${sinkConfig.remote_write_tenant_header || '不带 Tenant Header'}`
+    : `${j.sink_kind} / ${sinkConfig.compression}`;
+  $('cfgSink').title = sinkConfig.kind === 'remote_write' ? sinkConfig.remote_write_url : '';
   $('cfgParallel').textContent = `块 ${j.options.block_parallel} · 解码 ${j.options.decode_workers}`;
   $('cfgBatch').textContent = `${fmtInt(j.options.batch_samples)} samples · ${fmtInt(j.options.unit_series)} series`;
   $('cfgFilter').textContent = filterText(d.config.filter);
@@ -558,6 +562,20 @@ function toggleSource() {
   $('mimirSourceFields').classList.toggle('hidden', !m);
 }
 
+function toggleSink() {
+  const remoteWrite = $('fSink').value === 'remote_write';
+  const compression = $('fCompression');
+  $('remoteWriteFields').classList.toggle('hidden', !remoteWrite);
+  if (remoteWrite && !compression.disabled) {
+    compression.dataset.previousValue = compression.value;
+    compression.value = 'snappy';
+  } else if (!remoteWrite && compression.disabled) {
+    compression.value = compression.dataset.previousValue || 'zstd';
+    delete compression.dataset.previousValue;
+  }
+  compression.disabled = remoteWrite;
+}
+
 async function discoverTenants() {
   const cfg = mimirConfig();
   if (!cfg.bucket) { toast('请输入 bucket 或本地目录', true); return; }
@@ -638,11 +656,17 @@ function parseMatchers(text) {
 
 async function createJob() {
   const m = mimirMode();
+  const sinkKind = $('fSink').value;
   const dataDir = $('fDataDir').value.trim();
   const outDir = $('fOutDir').value.trim();
   if (!m && !dataDir) { toast('请输入数据目录', true); return; }
   if (m && !$('fMimirBucket').value.trim()) { toast('请输入 bucket 或本地目录', true); return; }
   if (!outDir) { toast('请输入输出目录', true); return; }
+  const remoteWriteUrl = $('fRemoteWriteUrl').value.trim();
+  if (sinkKind === 'remote_write' && !remoteWriteUrl) {
+    toast('请输入 Remote Write endpoint URL', true);
+    return;
+  }
   const minText = $('fMinTime').value.trim();
   const maxText = $('fMaxTime').value.trim();
   let filter;
@@ -670,11 +694,13 @@ async function createJob() {
     blocks: m || allSelected || S.selectedBlocks.size === 0 ? [] : Array.from(S.selectedBlocks),
     filter,
     sink: {
-      kind: $('fSink').value,
-      compression: $('fCompression').value,
+      kind: sinkKind,
+      compression: sinkKind === 'remote_write' ? 'snappy' : $('fCompression').value,
       row_group_size: 65536,
       duckdb_path: '',
       duckdb_exec: true,
+      remote_write_url: remoteWriteUrl,
+      remote_write_tenant_header: $('fRemoteWriteTenantHeader').value.trim(),
     },
     options: {
       block_parallel: Number($('fBlockParallel').value) || 2,
@@ -762,6 +788,8 @@ function bind() {
     openModal('newModal');
   });
   $('fSource').addEventListener('change', toggleSource);
+  $('fSink').addEventListener('change', toggleSink);
+  toggleSink();
   $('btnScan').addEventListener('click', scanBlocks);
   $('btnDiscoverTenants').addEventListener('click', discoverTenants);
   $('btnCreate').addEventListener('click', createJob);

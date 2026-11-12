@@ -231,6 +231,11 @@ Content-Type: application/json
 - `blocks` 为空表示全部块。
 - `filter.matchers` 是精确匹配，AND 关系；暂不支持正则。
 - `sink.kind`：`parquet` | `ndjson` | `duckdb`。`duckdb` = 先写 Parquet，完成后调用 `duckdb` CLI 装载。
+- `sink.kind` 也支持 `remote_write`：设置 `sink.remote_write_url` 为完整写入 URL，可选设置 `sink.remote_write_tenant_header`（默认 `X-Scope-OrgID`）。Bearer token 从服务端环境变量 `TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN` 读取，不进入任务状态文件。
+- `remote_write_tenant_header` 可留空，但此时若计划中有多个 Mimir tenant 会直接返回配置错误（否则多个 tenant 的数据会混成一路）；仅单 tenant 时留空放行并记一条 Warn。
+- Remote Write v1.0 不支持 native histogram；遇到 histogram 样本时 block 失败（不静默丢弃）。同 unit 内已被其他 worker 推送的数据可能已到达接收端，需要按 tenant/series 清理后重跑。
+- Block 会按 tenant 和时间串行发送（`block_parallel` 被强制为 1）；同一 tenant 的 Block 时间范围重叠时拒绝迁移，以保证单个 series 的样本时间顺序。
+- 协议对照、重试语义、顺序保证与测试矩阵见 `08-remote-write-sink.md`。
 - `sink.duckdb_path`：Prometheus 源为 `.duckdb` 文件；Mimir 源为目录（每 tenant 一个 `<tenant>.duckdb`）。为空时使用默认路径。
 - DuckDB 最终为「每个 metric 一张表、label 作为列、包含 `timestamp`」；Prometheus 单实例、Mimir 每 tenant 独立实例。详见 `07-duckdb-schema.md`。
 - 创建时会同步执行 planning（扫描 `meta.json` / 必要时 index），返回时 `engine_ready=true`。

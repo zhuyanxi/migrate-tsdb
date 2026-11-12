@@ -1,7 +1,7 @@
 //! The migration engine: block-level parallelism, bounded intrab-block
 //! pipeline, cooperative pause/stop, unit checkpoints and sinks.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -68,21 +68,38 @@ impl Engine {
     }
 
     pub fn new_with_id(
-        cfg: JobConfig,
+        mut cfg: JobConfig,
         control: Arc<Control>,
         events: Arc<dyn EventSink>,
         job_id: String,
         started_ms: Option<i64>,
     ) -> Result<Self> {
         cfg.validate()?;
+        if cfg.sink.kind == SinkKind::RemoteWrite {
+            sink::remote_write::validate_config(
+                &cfg.sink.remote_write_url,
+                &cfg.sink.remote_write_tenant_header,
+            )?;
+        }
         let mimir = match &cfg.mimir {
             Some(m) => Some(Arc::new(MimirSource::new(m, &cfg.output_dir)?)),
             None => None,
         };
-        let plan = match &mimir {
+        let mut plan = match &mimir {
             Some(source) => source.plan(&cfg)?,
             None => planner::plan(&cfg)?,
         };
+        if cfg.sink.kind == SinkKind::RemoteWrite {
+            if cfg.options.block_parallel != 1 {
+                events.log(
+                    LogLevel::Warn,
+                    "remote_write serializes blocks to preserve per-series timestamp order",
+                );
+                cfg.options.block_parallel = 1;
+            }
+            check_remote_write_tenants(&plan, &cfg.sink.remote_write_tenant_header, &*events)?;
+            order_remote_write_blocks(&mut plan)?;
+        }
         let stats = Arc::new(JobStats::new(job_id, cfg.clone(), &plan.blocks, started_ms));
         for w in &plan.warnings {
             events.log(LogLevel::Warn, w);
@@ -275,7 +292,9 @@ impl Engine {
                 .log(LogLevel::Warn, &format!("写 manifest 失败：{e}"));
         }
 
-        if state == JobState::Completed && self.cfg.sink.kind != SinkKind::Ndjson {
+        if state == JobState::Completed
+            && !matches!(self.cfg.sink.kind, SinkKind::Ndjson | SinkKind::RemoteWrite)
+        {
             match crate::duckdb::plan(&self.cfg.output_dir, &self.cfg.sink.duckdb_path) {
                 Ok(plans) => {
                     for p in &plans {
@@ -683,6 +702,75 @@ impl Engine {
         });
 
         coord_result
+    }
+}
+
+fn order_remote_write_blocks(plan: &mut Plan) -> Result<()> {
+    plan.blocks.sort_by(|left, right| {
+        left.info
+            .tenant
+            .cmp(&right.info.tenant)
+            .then_with(|| left.info.meta.min_time.cmp(&right.info.meta.min_time))
+    });
+
+    // Sorted by min_time, comparing each block against its predecessor is
+    // equivalent to a full non-overlap check: if every consecutive pair is
+    // disjoint the whole sequence is disjoint.
+    let mut previous: BTreeMap<String, (String, i64)> = BTreeMap::new();
+    for block in &plan.blocks {
+        let tenant = block.info.tenant.clone();
+        if let Some((previous_ulid, previous_max)) = previous.get(&tenant) {
+            if block.info.meta.min_time < *previous_max {
+                return Err(Error::config(format!(
+                    "remote_write requires non-overlapping block ranges for tenant {tenant:?}; \
+                     block {previous_ulid} [..{previous_max}] overlaps block {} [{}..]. \
+                     Remote Write receivers reject out-of-order samples, so select a single \
+                     compaction level with `blocks`/`--blocks` or narrow `filter.min_time`/`max_time`",
+                    block.info.meta.ulid, block.info.meta.min_time
+                )));
+            }
+        }
+        previous.insert(
+            tenant,
+            (block.info.meta.ulid.clone(), block.info.meta.max_time),
+        );
+    }
+    Ok(())
+}
+
+/// A Remote Write endpoint identifies the target tenant by header. Dropping that
+/// header while several Mimir tenants are in flight silently merges them, so it
+/// is refused; with a single tenant it is only a warning.
+fn check_remote_write_tenants(
+    plan: &Plan,
+    tenant_header: &str,
+    events: &dyn EventSink,
+) -> Result<()> {
+    if !tenant_header.trim().is_empty() {
+        return Ok(());
+    }
+    let tenants: BTreeSet<&str> = plan
+        .blocks
+        .iter()
+        .map(|block| block.info.tenant.as_str())
+        .filter(|tenant| !tenant.is_empty())
+        .collect();
+    match tenants.len() {
+        0 | 1 => {
+            if let Some(tenant) = tenants.first() {
+                events.log(
+                    LogLevel::Warn,
+                    &format!(
+                        "remote_write 未配置 tenant header，tenant {tenant} 的数据将写入接收端的默认 tenant"
+                    ),
+                );
+            }
+            Ok(())
+        }
+        count => Err(Error::config(format!(
+            "remote_write 会把 {count} 个 Mimir tenant 写入同一路数据流；请设置 \
+             sink.remote_write_tenant_header（例如 X-Scope-OrgID）或只选择单个 tenant"
+        ))),
     }
 }
 
@@ -1284,4 +1372,161 @@ pub fn validate_options(options: &EngineOptions) -> Result<()> {
     cfg.output_dir = "/tmp".into();
     cfg.options = options.clone();
     cfg.validate()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::{Plan, PlannedBlock};
+    use std::path::PathBuf;
+    use tsdb_reader::meta::BlockMetaCompaction;
+    use tsdb_reader::{BlockInfo, BlockMeta, IndexStats};
+
+    fn block(tenant: &str, ulid: &str, min_time: i64, max_time: i64) -> PlannedBlock {
+        PlannedBlock {
+            info: BlockInfo {
+                path: PathBuf::from(format!("/tmp/{tenant}/{ulid}")),
+                tenant: tenant.to_string(),
+                remote: false,
+                meta: BlockMeta {
+                    ulid: ulid.to_string(),
+                    min_time,
+                    max_time,
+                    stats: Default::default(),
+                    compaction: BlockMetaCompaction::default(),
+                    version: 1,
+                },
+                index_bytes: 0,
+                chunks_bytes: 0,
+                tombstones_bytes: 0,
+                warnings: Vec::new(),
+            },
+            stats: IndexStats::default(),
+            samples_expected: 0,
+        }
+    }
+
+    fn plan(blocks: Vec<PlannedBlock>) -> Plan {
+        Plan {
+            blocks,
+            skipped_by_time: 0,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sorts_blocks_by_tenant_then_time() {
+        let mut p = plan(vec![
+            block("tenant-b", "b2", 200, 300),
+            block("tenant-a", "a2", 200, 300),
+            block("tenant-a", "a1", 100, 200),
+        ]);
+        order_remote_write_blocks(&mut p).unwrap();
+        let order: Vec<&str> = p.blocks.iter().map(|b| b.info.meta.ulid.as_str()).collect();
+        assert_eq!(order, vec!["a1", "a2", "b2"]);
+    }
+
+    #[test]
+    fn allows_adjacent_non_overlapping_blocks() {
+        let mut p = plan(vec![block("", "a", 0, 100), block("", "b", 100, 200)]);
+        order_remote_write_blocks(&mut p).unwrap();
+    }
+
+    #[test]
+    fn allows_identical_ranges_for_different_tenants() {
+        let mut p = plan(vec![
+            block("tenant-a", "a", 0, 1000),
+            block("tenant-b", "b", 0, 1000),
+        ]);
+        order_remote_write_blocks(&mut p).unwrap();
+    }
+
+    #[test]
+    fn rejects_overlapping_blocks() {
+        let mut p = plan(vec![block("", "a", 0, 100), block("", "b", 50, 60)]);
+        assert!(order_remote_write_blocks(&mut p).is_err());
+    }
+
+    struct CountingEvents(std::sync::atomic::AtomicUsize);
+
+    impl CountingEvents {
+        fn new() -> Self {
+            Self(std::sync::atomic::AtomicUsize::new(0))
+        }
+        fn warns(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl EventSink for CountingEvents {
+        fn log(&self, level: LogLevel, _msg: &str) {
+            if level == LogLevel::Warn {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_multi_tenant_remote_write_without_a_tenant_header() {
+        let p = plan(vec![
+            block("tenant-a", "a", 0, 100),
+            block("tenant-b", "b", 0, 100),
+        ]);
+        let events = CountingEvents::new();
+        let error = check_remote_write_tenants(&p, "", &events).unwrap_err();
+        assert!(
+            error.to_string().contains("remote_write_tenant_header"),
+            "{error}"
+        );
+        assert_eq!(events.warns(), 0);
+    }
+
+    #[test]
+    fn allows_multi_tenant_remote_write_with_a_tenant_header() {
+        let p = plan(vec![
+            block("tenant-a", "a", 0, 100),
+            block("tenant-b", "b", 0, 100),
+        ]);
+        check_remote_write_tenants(&p, "X-Scope-OrgID", &NoopEvents).unwrap();
+    }
+
+    #[test]
+    fn warns_when_a_single_tenant_has_no_header() {
+        let p = plan(vec![block("tenant-a", "a", 0, 100)]);
+        let events = CountingEvents::new();
+        check_remote_write_tenants(&p, "", &events).unwrap();
+        assert_eq!(events.warns(), 1);
+    }
+
+    #[test]
+    fn ignores_tenants_for_a_plain_data_directory() {
+        let p = plan(vec![block("", "a", 0, 100), block("", "b", 200, 300)]);
+        let events = CountingEvents::new();
+        check_remote_write_tenants(&p, "", &events).unwrap();
+        assert_eq!(events.warns(), 0);
+    }
+
+    #[test]
+    fn overlap_error_names_both_blocks() {
+        let mut p = plan(vec![block("", "aaa", 0, 100), block("", "bbb", 50, 60)]);
+        let error = order_remote_write_blocks(&mut p).unwrap_err().to_string();
+        assert!(error.contains("aaa"), "{error}");
+        assert!(error.contains("bbb"), "{error}");
+        assert!(error.contains("--blocks"), "{error}");
+    }
+
+    #[test]
+    fn rejects_transitively_overlapping_blocks() {
+        // a=[0,100] contains b=[50,60] and c=[70,200]. Comparing only the
+        // previous block's max_time would let c through even though it overlaps a.
+        let mut p = plan(vec![
+            block("", "a", 0, 100),
+            block("", "b", 50, 60),
+            block("", "c", 70, 200),
+        ]);
+        assert!(
+            order_remote_write_blocks(&mut p).is_err(),
+            "overlap with an earlier block must be detected"
+        );
+    }
 }

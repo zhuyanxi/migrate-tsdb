@@ -177,7 +177,7 @@
             <div class="kv"><span class="k">Tenant</span><span class="v" id="cfgTenants">—</span></div>
             <div class="kv"><span class="k">数据目录</span><span class="v" id="cfgDataDir">—</span></div>
             <div class="kv"><span class="k">输出目录</span><span class="v" id="cfgOutDir">—</span></div>
-            <div class="kv"><span class="k">Sink / 压缩</span><span class="v" id="cfgSink">—</span></div>
+            <div class="kv"><span class="k">Sink / 配置</span><span class="v" id="cfgSink">—</span></div>
             <div class="kv"><span class="k">并行</span><span class="v" id="cfgParallel">—</span></div>
             <div class="kv"><span class="k">批 / 单元</span><span class="v" id="cfgBatch">—</span></div>
             <div class="kv"><span class="k">过滤</span><span class="v" id="cfgFilter">—</span></div>
@@ -280,12 +280,22 @@
             <option value="parquet">parquet（DuckDB-ready）</option>
             <option value="duckdb">duckdb（parquet + 自动装载）</option>
             <option value="ndjson">ndjson（调试）</option>
+            <option value="remote_write">Prometheus Remote Write v1.0</option>
           </select>
           <select id="fCompression">
             <option value="zstd">zstd</option>
             <option value="snappy">snappy</option>
             <option value="none">none</option>
           </select>
+        </div>
+
+        <div class="remote-write-fields hidden" id="remoteWriteFields">
+          <label for="fRemoteWriteUrl">Remote Write URL</label>
+          <input type="text" id="fRemoteWriteUrl" placeholder="https://receiver.example/api/v1/write">
+
+          <label for="fRemoteWriteTenantHeader">Tenant Header</label>
+          <input type="text" id="fRemoteWriteTenantHeader" value="X-Scope-OrgID" placeholder="留空表示不发送">
+          <div class="hint">Remote Write v1.0 使用 Snappy；Bearer token 使用 TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN 环境变量。v1.0 不支持 native histogram。</div>
         </div>
 
         <label>并行度</label>

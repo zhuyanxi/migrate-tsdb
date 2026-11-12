@@ -74,6 +74,23 @@ export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
 ./target/release/tsdb-migrate migrate --mimir-local-root /mnt/mimir-mirror --out /mnt/export
 ```
 
+### Prometheus Remote Write
+
+The `remote-write` sink sends Prometheus Remote Write v1.0 requests. The receiver URL must include its write path. For Mimir, each tenant is sent in the `X-Scope-OrgID` header by default; override it with `--remote-write-tenant-header`. Disabling the header is only allowed when a single tenant is migrated — with several tenants in one plan the job is rejected, because their data would otherwise merge into one stream.
+
+```bash
+export TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN=replace-me
+./target/release/tsdb-migrate migrate \
+  --data-dir /prometheus/data \
+  --out /mnt/export \
+  --sink remote-write \
+  --remote-write-url https://receiver.example/api/v1/write
+```
+
+The Server/Web sink selector accepts the same endpoint and tenant-header settings. Remote Write v1.0 does not support native histogram samples; encountering one fails the migration instead of dropping it. Blocks are sent serially in time order, and overlapping ranges for the same tenant are rejected to preserve per-series sample order. HTTP delivery and local checkpoints are not one transaction, so an uncertain response or process exit before checkpointing may cause the current batch to be resent; exactly-once delivery is not guaranteed.
+
+Protocol compliance, retry semantics, ordering guarantees and the test matrix are documented in `docs/08-remote-write-sink.md`.
+
 ### Server + Web
 
 ```bash
@@ -133,6 +150,7 @@ WHERE "timestamp" >= TIMESTAMP '2026-11-01 00:00:00';
 | [docs/05-verification.md](docs/05-verification.md) | 对拍、端到端、断点续传、性能实测与已知限制 |
 | [docs/06-mimir-source.md](docs/06-mimir-source.md) | Mimir 接入方式、对象定位规则、各层改动范围与兼容性 |
 | [docs/07-duckdb-schema.md](docs/07-duckdb-schema.md) | DuckDB metric 宽表、按 tenant 分库、DDL 与装载流程 |
+| [docs/08-remote-write-sink.md](docs/08-remote-write-sink.md) | Remote Write v1.0 协议对照、顺序保证、重试语义、审查与测试记录 |
 
 ## 仓库结构
 

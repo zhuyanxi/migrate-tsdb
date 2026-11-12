@@ -2,6 +2,7 @@
 
 pub mod ndjson;
 pub mod parquet;
+pub mod remote_write;
 
 use std::path::{Path, PathBuf};
 
@@ -61,6 +62,11 @@ pub fn create_sink(
             cfg.sink.row_group_size,
         )?)),
         SinkKind::Ndjson => Ok(Box::new(ndjson::NdjsonSink::new(dir, worker)?)),
+        SinkKind::RemoteWrite => Ok(Box::new(remote_write::RemoteWriteSink::new(
+            &cfg.sink.remote_write_url,
+            &cfg.sink.remote_write_tenant_header,
+            tenant,
+        )?)),
     }
 }
 
