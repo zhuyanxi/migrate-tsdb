@@ -250,6 +250,9 @@
             <input type="text" id="fMimirCache" placeholder="缓存目录（默认 &lt;out&gt;/.cache）">
           </div>
 
+          <label for="fMimirMaxConcurrentDownloads">下载并发数</label>
+          <input type="number" id="fMimirMaxConcurrentDownloads" value="8" min="1" max="64" step="1" title="max_concurrent_downloads">
+
           <label>发现 Tenant</label>
           <div class="row-2">
             <button id="btnDiscoverTenants">扫描 Tenant</button>

@@ -546,7 +546,7 @@ function mimirConfig() {
     tenants: [],
     cache_dir: $('fMimirCache').value.trim(),
     keep_cache: $('fMimirKeep').checked,
-    max_concurrent_downloads: 8,
+    max_concurrent_downloads: Number($('fMimirMaxConcurrentDownloads').value) || 8,
     allow_http: endpoint.startsWith('http://'),
     force_path_style: endpoint.length > 0,
   };
