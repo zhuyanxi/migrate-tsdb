@@ -417,6 +417,11 @@ export AWS_REGION=us-east-1
 - `--mimir-keep-cache` 保留缓存，便于重跑/调试；会持续占用磁盘。
 - 下载并发由 `--mimir-downloads`（默认 8）控制，受 `block_parallel` 限制。
 - 对象存储延迟高时，可适当提高 `max_concurrent_downloads`；内存不随下载并发线性增长（流式写盘）。
+- 下载按 `--mimir-part-mb`（默认 256 MiB）分片 + 断点续传；失败后缓存目录保留，重跑自动补齐。
+- 单次 GET 默认**不设总超时**（`--mimir-timeout-secs 0`），只保留 `--mimir-read-timeout-secs`（默认 120s）
+  的停滞检测。若必须限制单请求时长（例如限制总带宽的代理），注意它覆盖整个响应体，
+  大对象会被腰斩成 `request or response body error`。
+- 连续零进展 `--mimir-download-retries`（默认 20）次后才放弃该对象。
 
 ### 7.4 API / Web
 

@@ -183,6 +183,18 @@ struct MimirArgs {
     mimir_local_root: Option<PathBuf>,
     #[arg(long, default_value_t = 8)]
     mimir_downloads: usize,
+    /// Ranged-GET part size in MiB; interrupted objects resume mid-file.
+    #[arg(long, default_value_t = 256)]
+    mimir_part_mb: u64,
+    /// Deadline for a single ranged GET in seconds; 0 (default) disables it.
+    #[arg(long, default_value_t = 0)]
+    mimir_timeout_secs: u64,
+    /// Abort a body read stalled this many seconds; 0 disables the check.
+    #[arg(long, default_value_t = 120)]
+    mimir_read_timeout_secs: u64,
+    /// Consecutive attempts without progress before an object is abandoned.
+    #[arg(long, default_value_t = 20)]
+    mimir_download_retries: usize,
     #[arg(long)]
     mimir_allow_http: bool,
     #[arg(long)]
@@ -221,6 +233,10 @@ impl MimirArgs {
                 .unwrap_or_default(),
             keep_cache: self.mimir_keep_cache,
             max_concurrent_downloads: self.mimir_downloads,
+            download_part_mb: self.mimir_part_mb,
+            download_timeout_secs: self.mimir_timeout_secs,
+            download_read_timeout_secs: self.mimir_read_timeout_secs,
+            download_retries: self.mimir_download_retries,
             allow_http: self.mimir_allow_http,
             force_path_style: self.mimir_path_style,
         };

@@ -50,6 +50,10 @@ pub struct MimirConfig {
     pub cache_dir: String,       // 空 = <output>/.cache
     pub keep_cache: bool,
     pub max_concurrent_downloads: usize, // 1..=64, default 8
+    pub download_part_mb: u64,           // 1..=4096, default 256
+    pub download_timeout_secs: u64,      // 0 = unlimited, default 0
+    pub download_read_timeout_secs: u64, // 0 = unlimited, default 120
+    pub download_retries: usize,         // 1..=1000, default 20
     pub allow_http: bool,
     pub force_path_style: bool,
 }
@@ -109,16 +113,43 @@ list_with_delimiter(<prefix>/)           → tenant 列表
 
 ```
 <output>/.cache/<tenant>/<ULID>/
-  meta.json, index, tombstones, chunks/...
-  .tsdb-migrate-ready        # 所有对象写完后写入
+  meta.json, index, tombstones, chunks/...    # 完成后才出现
+  index.tsdb-part, chunks/000001.tsdb-part     # 下载中的对象（可续传）
+  .tsdb-migrate-ready                         # 所有对象写完后写入
 ```
 
 - 每个 block 独立下载；并发由 `max_concurrent_downloads` 控制，且受 `block_parallel` 限制。
 - 暂停/停止在单元边界生效；如果正在下载一个块，会等该块下载完成后再进入暂停/停止。
-- 每个对象通过 `GetResult::into_stream()` 流式写文件，不在内存中聚合整个块。
-- 下载失败删除整个缓存目录；成功写 `.ready`。
+- **对象按 `download_part_mb`（默认 256 MiB）分片，用 Range GET 拉取**，先写到
+  `<name>.tsdb-part`，完成后 rename 成正式文件名：文件要么完整、要么不出现。
+- **任何中断都从已落盘的字节续传**：body 流断开、请求停滞、响应体短于 Content-Range、
+  进程被杀，都只是让下一次尝试从当前偏移继续，不会重传整个对象。
+- `download_retries` 统计的是**连续零进展**的失败次数；只要有 1 个字节进展就清零，
+  所以慢链路一路续传不会被判失败。
+- 每个对象已完整（大小匹配）时直接跳过，因此失败后重跑只补齐缺的部分。
+- **下载失败不删除缓存目录**，错误信息会带 `partial download kept in <dir>; rerun to resume`。
 - 块迁移完成后默认删除缓存；`keep_cache=true` 保留。
 - 暂停/停止/失败时保留缓存，便于 resume 复用。
+
+#### 为什么必须关掉默认的 30s 请求超时
+
+object_store 的 `ClientOptions::timeout` 默认 **30 秒**，且覆盖**整个响应体**
+（reqwest 的 `TotalTimeoutBody`）。单次 GET 的 body 超过 30 秒就报：
+
+```
+Generic S3 error: HTTP error: request or response body error
+```
+
+object_store 对 body 流的内部重试还受 `RetryConfig::retry_timeout`（默认 180 秒，从首次
+请求起算）限制，超预算后错误直接上抛。于是 20 GiB 的 `index` 在默认参数下只有在
+「约 150 秒内推完 20 GiB」时才能成功，否则必然失败；512 MiB 的 chunk 不受影响。
+
+本实现因此：
+
+- `download_timeout_secs = 0`（默认）→ `ClientOptions::with_timeout_disabled()`；
+  需要硬上限时设为秒数。
+- 用 `download_read_timeout_secs`（默认 120）代替总超时，只掐「连续 N 秒没有数据」的停滞连接。
+- `RetryConfig { max_retries, retry_timeout: 3600s }`，把恢复责任交给上面的分片循环。
 
 ---
 

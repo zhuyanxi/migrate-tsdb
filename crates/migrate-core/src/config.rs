@@ -161,6 +161,12 @@ fn default_remote_write_tenant_header() -> String {
 fn default_downloads() -> usize {
     8
 }
+fn default_part_mb() -> u64 {
+    256
+}
+fn default_download_retries() -> usize {
+    20
+}
 
 /// Grafana Mimir block storage on object storage.
 ///
@@ -187,6 +193,23 @@ pub struct MimirConfig {
     pub keep_cache: bool,
     #[serde(default = "default_downloads")]
     pub max_concurrent_downloads: usize,
+    /// Ranged-GET part size in MiB. Objects are fetched in parts of this size,
+    /// so an interrupted transfer resumes from the last completed byte instead
+    /// of restarting the whole object (a 20 GiB `index` needs this).
+    #[serde(default = "default_part_mb")]
+    pub download_part_mb: u64,
+    /// Deadline for a single ranged GET in seconds. `0` disables the request
+    /// deadline entirely: object_store defaults to 30 s, which aborts the body
+    /// stream of any object that takes longer to transfer.
+    pub download_timeout_secs: u64,
+    /// Abort a stalled body read after this many seconds without data.
+    /// `0` disables the stall timeout (a dead connection then hangs forever).
+    pub download_read_timeout_secs: u64,
+    /// Consecutive failed attempts **without progress** before an object is
+    /// given up on. Any byte of progress resets the counter, so a slow link
+    /// that keeps resuming never trips it.
+    #[serde(default = "default_download_retries")]
+    pub download_retries: usize,
     /// Allow plain HTTP S3 endpoints (MinIO/LocalStack).
     pub allow_http: bool,
     /// Use path-style addressing (`endpoint/bucket/key`) instead of virtual host.
@@ -205,6 +228,10 @@ impl Default for MimirConfig {
             cache_dir: String::new(),
             keep_cache: false,
             max_concurrent_downloads: default_downloads(),
+            download_part_mb: default_part_mb(),
+            download_timeout_secs: 0,
+            download_read_timeout_secs: 120,
+            download_retries: default_download_retries(),
             allow_http: false,
             force_path_style: false,
         }
@@ -224,6 +251,22 @@ impl MimirConfig {
         if self.max_concurrent_downloads == 0 || self.max_concurrent_downloads > 64 {
             return Err(Error::config(
                 "mimir.max_concurrent_downloads must be in 1..=64",
+            ));
+        }
+        if self.download_part_mb == 0 || self.download_part_mb > 4096 {
+            return Err(Error::config("mimir.download_part_mb must be in 1..=4096"));
+        }
+        if self.download_retries == 0 || self.download_retries > 1000 {
+            return Err(Error::config("mimir.download_retries must be in 1..=1000"));
+        }
+        if self.download_timeout_secs > 7 * 24 * 3600 {
+            return Err(Error::config(
+                "mimir.download_timeout_secs must be <= 604800 (7 days)",
+            ));
+        }
+        if self.download_read_timeout_secs > 3600 {
+            return Err(Error::config(
+                "mimir.download_read_timeout_secs must be <= 3600",
             ));
         }
         for t in &self.tenants {
@@ -247,6 +290,11 @@ impl MimirConfig {
         } else {
             format!("{p}/")
         }
+    }
+
+    /// Ranged-GET part size in bytes (clamped to a sane range).
+    pub fn download_part_bytes(&self) -> u64 {
+        self.download_part_mb.clamp(1, 4096) * 1024 * 1024
     }
 
     pub fn cache_root(&self, output_dir: &std::path::Path) -> PathBuf {

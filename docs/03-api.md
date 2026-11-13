@@ -129,6 +129,10 @@ GET /api/blocks?data_dir=<path>&scan=<bool>&limit=<n>
     "cache_dir": "",
     "keep_cache": false,
     "max_concurrent_downloads": 8,
+    "download_part_mb": 256,
+    "download_timeout_secs": 0,
+    "download_read_timeout_secs": 120,
+    "download_retries": 20,
     "allow_http": false,
     "force_path_style": false
   },
