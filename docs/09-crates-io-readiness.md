@@ -2,6 +2,21 @@
 
 > 评估对象：`crates/tsdb-reader`（3156 行，其中 src 2234 行 / tests 402 行）
 > 结论：**代码质量足以内部使用，但离「可公开发布」还差一轮工程化收尾。** 有 3 个阻塞项（其中 2 个是实证的功能缺陷），其余为 API 收敛、文档与发布流程工作。
+>
+> **2026-11-13 更新：P0 五项已全部修复并通过打包沙箱验证**，结果见 §0.1。剩余工作为 P1 / P2。
+
+## 0.1 P0 完成情况
+
+| 项 | 状态 | 验证方式 |
+|----|------|----------|
+| P0-1 `BitReader::read_bits` 位下溢 | ✅ 已修复 | 新增 6 个单测，覆盖截断分裂读、恰好够用的尾部、跨整字重填、`read_bits(0)`、`read_bits(65)`、全长度遍历不 panic；debug 与 release 双 profile 通过 |
+| P0-2 `open_info` 丢失 `tenant`/`remote` | ✅ 已修复 | 新增 5 个单测：保留调用方元数据、空 ULID 回退、与 `open` 等价、非 block 目录报错、`block_dir` |
+| P0-3 打包产物测试不可运行 | ✅ 已修复 | 最小 fixture 随包（`tests/data`，817 KiB / 117 KiB 压缩）；新增 fixture 漂移检测；沙箱内 41 测试全通过 |
+| P0-4 元数据 / README / LICENSE | ✅ 已修复 | `cargo package` 与 `cargo publish --dry-run` 零告警；新增 4 个打包元数据断言 |
+| P0-5 `chunks.rs` 文档与实现矛盾 | ✅ 已修复 | 模块文档改为 `data(len)` + CRC 覆盖 `encoding‖data`；新增 6 个布局单测（含 CRC 覆盖编码字节、截断记录、零长度记录、越界引用） |
+
+测试总量：`tsdb-reader` 由 17 项（13 单测 + 4 集成）增至 **41 项**（30 单测 + 9 集成 + 2 文档测试）。
+
 
 ---
 
@@ -11,21 +26,21 @@
 |----|------|------|
 | crate 名 `tsdb-reader` | crates.io 返回 404，**可用** | ✅ |
 | `cargo package` | 通过（20 文件，97 KiB / 23.7 KiB 压缩） | ✅ |
-| 打包产物内 `cargo test` | **2 个集成测试失败**（fixtures 不在包内） | ❌ |
-| `cargo test --doc` | 0 个 | ❌ |
-| `missing_docs` 警告 | **145 条** | ❌ |
-| `clippy` | 13 条（lib 5 条） | ⚠️ |
+| 打包产物内 `cargo test` | 41 项全部通过（fixture 随包发布） | ✅ |
+| `cargo test --doc` | 2 个（README 示例，经 `#![doc = include_str!]` 引入） | ✅ |
+| `missing_docs` 警告 | 145 条（P1-8 待处理） | ❌ |
+| `clippy` | 9 条，全部为历史遗留（lib 4 条）；新增代码 0 条 | ⚠️ |
 | `cargo fmt --check` | 通过 | ✅ |
-| Cargo.toml 元数据 | 只有 name/version/edition/license；`cargo package` 明确告警缺少 description/documentation/homepage/repository | ❌ |
-| 包内 README / LICENSE | 均无（`readme = false`） | ❌ |
+| Cargo.toml 元数据 | description/repository/homepage/documentation/readme/keywords/categories/rust-version/docs.rs 均齐备 | ✅ |
+| 包内 README / LICENSE | 均已随包，`readme = "README.md"` | ✅ |
 | features | 无任何 feature 声明 | ⚠️ |
 | CI | 无 `.github/` | ❌ |
 | `unsafe` | 2 处（`MmapOptions::map`），无 `unwrap`/`panic!` | ✅ |
-| 单元测试 | 13 个（varint/bstream/varbit/index 对齐/meta/tombstones） | ⚠️ |
+| 单元测试 | 30 个（新增 bstream 边界、chunk 布局、block 元数据） | ✅ |
 
 ---
 
-## 1. 阻塞项（P0）
+## 1. 阻塞项（P0）—— 已全部修复
 
 ### P0-1 `BitReader::read_bits` 在截断输入上 debug panic / release 静默错值
 
@@ -184,8 +199,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 | 层次 | 现状 | 缺口 |
 |------|------|------|
 | 单元测试 | 13 个：varint 3、bstream 3、varbit 2、index 2、meta 1、tombstones 2 | **6 种 chunk 解码器没有单元级测试**，仅靠 fixture 集成测试；`Symbols` 缓存、`scan_stats`、`SeriesIter` 提前终止、v1 索引路径均无覆盖 |
-| 集成测试 | 2 个（真实 block 对拍、chunk 编码对拍）——**打包后不可运行** | 见 P0-3 |
-| 文档测试 | 0 | 见 §7 |
+| 集成测试 | 9 个：真实 block 对拍 2、chunk 编码对拍 1、fixture 漂移 1、CRC 2、打包元数据 4 | `chunkenc` 仍缺畸形输入单测（P1-12） |
+| 文档测试 | 2 个（README 两个示例，`no_run` 编译通过） | 可继续补充 tombstone 过滤示例 |
 | 模糊测试 | 无 | 解析不可信字节的库应有 `cargo-fuzz` 目标：`varint`、`parse_series`、`chunkenc::decode`、`Tombstones::open` |
 | 属性测试 | 无 | `uvarint`/`varint` 的 round-trip（用 `proptest`）成本极低 |
 | 基准 | 无（仓库有 `scripts/bench.sh` 但在 crate 外） | 若以「快」为卖点，`benches/` 需要一组可复现数据 |
@@ -287,15 +302,15 @@ cargo doc -p tsdb-reader --no-deps --open
 
 ## 12. 待办清单（按优先级）
 
-### P0 — 阻塞发布（必做）
+### P0 — 阻塞发布（已全部完成）
 
-| # | 事项 | 验收标准 |
-|---|------|----------|
-| 1 | 修 `BitReader::read_bits` 位下溢 | debug 与 release 均返回 `Err(Eof)`；新增边界单测；补 fuzz 目标 |
-| 2 | 修 `BlockReader::open_info` 丢失 `tenant`/`remote` | 单测断言 `open_info(info).info().tenant == info.tenant` |
-| 3 | 让打包产物的测试可运行 | `cd target/package/tsdb-reader-*; cargo test` 全绿 |
-| 4 | 补齐 Cargo.toml 元数据 + README + LICENSE | `cargo package` 无元数据告警；crates.io 页面有描述与 README |
-| 5 | 修正 `chunks.rs` 模块文档中关于 `len` 的错误描述 | 文档与 `data_end = enc_start + 1 + len` 一致 |
+| # | 事项 | 验收标准 | 状态 |
+|---|------|----------|------|
+| 1 | 修 `BitReader::read_bits` 位下溢 | debug 与 release 均返回 `Err(Eof)`；新增边界单测 | ✅ 6 个单测；fuzz 目标留给 P2-18 |
+| 2 | 修 `BlockReader::open_info` 丢失 `tenant`/`remote` | 单测断言 `open_info(info).info().tenant == info.tenant` | ✅ 5 个单测 |
+| 3 | 让打包产物的测试可运行 | `cd target/package/tsdb-reader-*; cargo test` 全绿 | ✅ 41/41 通过 |
+| 4 | 补齐 Cargo.toml 元数据 + README + LICENSE | `cargo package` 无元数据告警；crates.io 页面有描述与 README | ✅ 零告警，`--dry-run` 通过 |
+| 5 | 修正 `chunks.rs` 模块文档中关于 `len` 的错误描述 | 文档与 `data_end = enc_start + 1 + len` 一致 | ✅ 6 个布局单测钉住语义 |
 
 ### P1 — 发布前强烈建议
 

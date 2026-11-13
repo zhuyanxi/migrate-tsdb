@@ -78,9 +78,23 @@ impl BlockReader {
         })
     }
 
+    /// Opens a block reusing metadata that was already discovered.
+    ///
+    /// The passed [`BlockInfo`] stays authoritative: `tenant`, `remote` and
+    /// `warnings` cannot be derived from the block directory, so they are never
+    /// overwritten. Only the byte counts measured while opening are refreshed,
+    /// and `meta` is filled from disk when the caller left its ULID empty.
     pub fn open_info(info: BlockInfo, opts: ReaderOptions) -> Result<Self> {
         let mut reader = Self::open(&info.path, opts)?;
-        reader.info.warnings = info.warnings;
+        let mut merged = info;
+        merged.index_bytes = reader.info.index_bytes;
+        merged.chunks_bytes = reader.info.chunks_bytes;
+        merged.tombstones_bytes = reader.info.tombstones_bytes;
+        if merged.meta.ulid.is_empty() {
+            merged.meta = reader.info.meta;
+        }
+        merged.warnings.extend(reader.info.warnings);
+        reader.info = merged;
         Ok(reader)
     }
 
@@ -179,4 +193,111 @@ impl std::fmt::Debug for BlockReader {
 /// Convenience for callers that only have a directory name.
 pub fn block_dir(root: &Path, ulid: &str) -> PathBuf {
     root.join(ulid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::{BlockMeta, BlockMetaCompaction, BlockStats};
+
+    fn fixture_block_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/block/01M70C8VV61N5H5VWXB17HQQ1R")
+    }
+
+    fn info_with(tenant: &str, remote: bool, ulid: &str) -> BlockInfo {
+        BlockInfo {
+            path: fixture_block_dir(),
+            tenant: tenant.to_string(),
+            remote,
+            meta: BlockMeta {
+                ulid: ulid.to_string(),
+                min_time: 0,
+                max_time: 0,
+                stats: BlockStats::default(),
+                compaction: BlockMetaCompaction::default(),
+                version: 2,
+            },
+            index_bytes: 0,
+            chunks_bytes: 0,
+            tombstones_bytes: 0,
+            warnings: vec!["discovery note".to_string()],
+        }
+    }
+
+    #[test]
+    fn open_info_keeps_caller_metadata() {
+        let info = info_with("tenant-a", true, "01M70C8VV61N5H5VWXB17HQQ1R");
+        let reader = BlockReader::open_info(info, ReaderOptions::default()).unwrap();
+
+        assert_eq!(reader.info().tenant, "tenant-a");
+        assert!(reader.info().remote);
+        assert_eq!(reader.info().warnings, vec!["discovery note"]);
+        assert_eq!(reader.block_id(), "01M70C8VV61N5H5VWXB17HQQ1R");
+        // Sizes must come from disk, not from the caller's zeros.
+        assert!(reader.info().index_bytes > 0);
+        assert!(reader.info().chunks_bytes > 0);
+    }
+
+    #[test]
+    fn open_info_falls_back_to_the_directory_name() {
+        let direct = BlockReader::open(&fixture_block_dir(), ReaderOptions::default()).unwrap();
+        let info = info_with("", false, "");
+        let reader = BlockReader::open_info(info, ReaderOptions::default()).unwrap();
+
+        assert_eq!(
+            reader.block_id(),
+            "01M70C8VV61N5H5VWXB17HQQ1R",
+            "an empty ULID must be taken from meta.json"
+        );
+        assert_eq!(reader.meta().version, direct.meta().version);
+        assert_eq!(reader.meta().min_time, direct.meta().min_time);
+    }
+
+    #[test]
+    fn open_info_matches_open_for_a_local_block() {
+        let dir = fixture_block_dir();
+        let direct = BlockReader::open(&dir, ReaderOptions::default()).unwrap();
+        let via_info = BlockReader::open_info(
+            BlockInfo {
+                path: dir.clone(),
+                tenant: String::new(),
+                remote: false,
+                meta: direct.meta().clone(),
+                index_bytes: 0,
+                chunks_bytes: 0,
+                tombstones_bytes: 0,
+                warnings: Vec::new(),
+            },
+            ReaderOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(direct.info().index_bytes, via_info.info().index_bytes);
+        assert_eq!(direct.info().chunks_bytes, via_info.info().chunks_bytes);
+        assert_eq!(
+            direct.info().tombstones_bytes,
+            via_info.info().tombstones_bytes
+        );
+        assert_eq!(direct.block_id(), via_info.block_id());
+        assert_eq!(
+            direct.scan_stats().unwrap().series,
+            via_info.scan_stats().unwrap().series
+        );
+    }
+
+    #[test]
+    fn open_rejects_a_non_block_directory() {
+        let error = BlockReader::open(&std::env::temp_dir(), ReaderOptions::default())
+            .expect_err("temp dir is not a block");
+        assert!(error.to_string().contains("meta.json"), "{error}");
+    }
+
+    #[test]
+    fn block_dir_joins_the_ulid() {
+        assert_eq!(
+            block_dir(Path::new("/data"), "01ABC"),
+            PathBuf::from("/data/01ABC")
+        );
+    }
 }

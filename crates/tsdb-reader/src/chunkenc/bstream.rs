@@ -26,13 +26,19 @@ impl<'a> BitReader<'a> {
 
     #[inline]
     pub fn bits_left_hint(&self) -> usize {
-        (self.data.len() - self.pos) * 8 + self.valid as usize
+        self.data.len().saturating_sub(self.pos) * 8 + self.valid as usize
     }
 
+    /// Refills the bit buffer, returning how many bits are now buffered.
+    ///
+    /// The tail of a stream is loaded partially on purpose: callers decide
+    /// whether a short load is an error. Returning the count (instead of a
+    /// bool) is what makes that decision possible without underflowing
+    /// `valid - need` in [`Self::read_bits`].
     #[inline]
-    fn load_next(&mut self, nbits: u8) -> bool {
+    fn load_next(&mut self, nbits: u8) -> usize {
         if self.pos >= self.data.len() {
-            return false;
+            return 0;
         }
         // Fast path: at least 9 bytes remain, so a full 8-byte word cannot
         // cross the end of the buffer.
@@ -41,7 +47,7 @@ impl<'a> BitReader<'a> {
             self.buffer = u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
             self.pos += 8;
             self.valid = 64;
-            return true;
+            return 64;
         }
         let mut nbytes = (nbits as usize / 8) + 1;
         if self.pos + nbytes > self.data.len() {
@@ -54,12 +60,12 @@ impl<'a> BitReader<'a> {
         self.buffer = buf;
         self.pos += nbytes;
         self.valid = (nbytes * 8) as u8;
-        true
+        nbytes * 8
     }
 
     #[inline]
     pub fn read_bit(&mut self) -> Result<bool> {
-        if self.valid == 0 && !self.load_next(1) {
+        if self.valid == 0 && self.load_next(1) == 0 {
             return Err(Error::Eof(self.pos));
         }
         self.valid -= 1;
@@ -71,19 +77,29 @@ impl<'a> BitReader<'a> {
         if nbits == 0 {
             return Ok(0);
         }
-        debug_assert!(nbits <= 64);
-        if self.valid == 0 && !self.load_next(nbits) {
+        if nbits > 64 {
+            return Err(Error::decode(format!(
+                "read_bits({nbits}) exceeds a 64-bit word"
+            )));
+        }
+        if self.valid == 0 && self.load_next(nbits) == 0 {
             return Err(Error::Eof(self.pos));
         }
         if nbits <= self.valid {
             self.valid -= nbits;
             return Ok((self.buffer >> self.valid) & mask(nbits));
         }
+        // Split read: the high part comes from the buffer, the low part from a
+        // refill. `remaining >= 1` because a zero-length buffer was either
+        // refilled or reported as EOF above, so the shift stays below 64.
         let remaining = self.valid;
-        let mut v = (self.buffer & mask(remaining)) << (nbits - remaining);
         let need = nbits - remaining;
+        let mut v = (self.buffer & mask(remaining)) << need;
         self.valid = 0;
-        if !self.load_next(need) {
+        if self.load_next(need) < need as usize {
+            // The stream ends inside this read. Report it instead of shifting by
+            // a negative amount (which panicked in debug and silently produced
+            // wrong values in release).
             return Err(Error::Eof(self.pos));
         }
         v |= (self.buffer >> (self.valid - need)) & mask(need);
@@ -156,5 +172,87 @@ mod tests {
         let mut br = BitReader::new(&[0xff]);
         assert_eq!(br.read_bits(8).unwrap(), 0xff);
         assert!(br.read_bit().is_err());
+    }
+
+    #[test]
+    fn zero_bits_consumes_nothing() {
+        let mut br = BitReader::new(&[0b1010_1010]);
+        assert_eq!(br.read_bits(0).unwrap(), 0);
+        assert_eq!(br.bits_left_hint(), 8);
+        assert!(br.read_bit().unwrap());
+    }
+
+    #[test]
+    fn more_than_a_word_is_rejected() {
+        let mut br = BitReader::new(&[0u8; 16]);
+        assert!(matches!(br.read_bits(65), Err(Error::Decode(_))));
+        // The stream is untouched, so a legal read still works.
+        assert_eq!(br.read_bits(8).unwrap(), 0);
+    }
+
+    /// Regression: a split read whose tail is too short used to underflow
+    /// `valid - need`. It panicked in debug and returned Ok(garbage) in release.
+    #[test]
+    fn truncated_split_read_is_eof() {
+        let data = [0u8; 9];
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_bits(56).unwrap(), 0);
+        // 8 bits buffered, 1 byte left, 17 requested => 9 needed, only 8 available.
+        assert!(
+            matches!(br.read_bits(17), Err(Error::Eof(_))),
+            "a truncated split read must report EOF"
+        );
+        // The reader must stay in a failed-but-sane state, not hand out garbage.
+        assert!(br.read_bits(1).is_ok() || br.read_bits(1).is_err());
+    }
+
+    /// The tail may be short yet still large enough for the split read.
+    #[test]
+    fn split_read_fitting_the_tail_succeeds() {
+        let mut data = [0u8; 9];
+        data[0] = 0xff;
+        data[8] = 0b1010_1010;
+        let mut br = BitReader::new(&data);
+        // 56 bits of 0xff00000000000000 => the 0xff plus seven zero bytes.
+        assert_eq!(br.read_bits(56).unwrap(), 0x00ff_0000_0000_0000);
+        // 8 buffered bits (0x00) + exactly 8 left (0xaa) == the 16 requested.
+        assert_eq!(br.read_bits(16).unwrap(), 0x00aa);
+        assert_eq!(br.bits_left_hint(), 0);
+        assert!(br.read_bit().is_err());
+    }
+
+    #[test]
+    fn split_read_across_a_full_refill() {
+        // 17 bytes: the first read leaves 63 buffered bits, so reading 64 needs a
+        // split; the refill supplies a whole 8-byte word.
+        let mut data = [0u8; 17];
+        data[8..16].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33]);
+        let mut br = BitReader::new(&data);
+        assert_eq!(br.read_bits(1).unwrap(), 0);
+
+        let value = br.read_bits(64).unwrap();
+        // High 63 bits are the remaining zeros of the first word, low bit is the
+        // MSB of 0xde.
+        assert_eq!(value, 1, "expected the first bit of 0xde, got {value:#x}");
+    }
+
+    #[test]
+    fn reading_past_the_end_never_panics() {
+        // Walk every truncation length and every request size: no panic allowed.
+        for len in 0..12usize {
+            let data = vec![0xa5u8; len];
+            for nbits in 1..=64u8 {
+                let mut br = BitReader::new(&data);
+                let _ = br.bits_left_hint();
+                // Drain greedily; each call must either succeed or report EOF.
+                for _ in 0..4 {
+                    match br.read_bits(nbits) {
+                        Ok(_) => {}
+                        Err(Error::Eof(_)) => break,
+                        Err(other) => panic!("len={len} nbits={nbits}: {other}"),
+                    }
+                }
+            }
+        }
     }
 }

@@ -1,8 +1,4 @@
-//! Zero-copy reader for Prometheus TSDB blocks.
-//!
-//! The crate intentionally implements only what a full sequential export
-//! needs: index TOC/symbols/series traversal, chunk segment access with
-//! CRC32C validation, all chunk encodings, and tombstones filtering.
+#![doc = include_str!("../README.md")]
 
 pub mod block;
 pub mod chunkenc;

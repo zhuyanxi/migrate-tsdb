@@ -3,6 +3,15 @@ name = "tsdb-reader"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Zero-copy, read-only parser for Prometheus TSDB blocks: index v1-v3, all chunk encodings, tombstones"
+repository = "https://github.com/zhuyanxi/migrate-tsdb"
+homepage = "https://github.com/zhuyanxi/migrate-tsdb/tree/main/crates/tsdb-reader"
+documentation = "https://docs.rs/tsdb-reader"
+readme = "README.md"
+keywords = ["prometheus", "tsdb", "metrics", "parser", "time-series"]
+categories = ["database", "database-implementations", "encoding"]
+rust-version = "1.70"
+include = ["src/**", "tests/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 memmap2.workspace = true
@@ -13,3 +22,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 crc32c.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
