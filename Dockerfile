@@ -13,6 +13,10 @@
 ARG RUST_VERSION=1
 FROM rust:${RUST_VERSION}-bookworm AS builder
 
+ARG CARGO_HTTP_TIMEOUT=300
+ARG CARGO_HTTP_LOW_SPEED_LIMIT=1
+ARG CARGO_NET_RETRY=5
+
 # aws-lc-sys (pulled in by object_store/reqwest through rustls) builds C/asm
 # sources and needs CMake plus a C toolchain; NASM is used on x86_64.
 RUN apt-get update \
@@ -27,7 +31,10 @@ RUN apt-get update \
 WORKDIR /src
 
 ENV CARGO_TERM_COLOR=always \
-    CARGO_INCREMENTAL=0
+  CARGO_INCREMENTAL=0 \
+  CARGO_HTTP_TIMEOUT=${CARGO_HTTP_TIMEOUT} \
+  CARGO_HTTP_LOW_SPEED_LIMIT=${CARGO_HTTP_LOW_SPEED_LIMIT} \
+  CARGO_NET_RETRY=${CARGO_NET_RETRY}
 
 # Only the manifests are copied first so dependency resolution stays cached
 # independently of source edits.
