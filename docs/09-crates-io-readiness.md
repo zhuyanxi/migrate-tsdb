@@ -26,7 +26,7 @@
 | `rust-version = "1.70"` | ❌ 低于依赖下界。`thiserror 2.0.21` 要求 1.77，`serde_json 1.0.154` / `serde_derive 1.0.229` / `proc-macro2` 要求 1.71。1.70–1.76 的用户会拿到构建失败。已改为 **1.77**，并在 1.77.0 工具链上实测 `cargo build` + 41 项测试全部通过 |
 | crate 名 | ✅ `tsdb-reader`、`tsdb_reader`、`prom-tsdb` 在 crates.io 均 404（可用）；`tsdb` 已存在但不构成同名/规范化冲突 |
 | 版本号 | ✅ 0.1.0 从未发布，无需避让 |
-| 许可证 | ✅ `Apache-2.0`，LICENSE 正文 11357 B 随包；依赖子树 19 个包的 license 均为 MIT OR Apache-2.0 |
+| 许可证 | ✅ `MIT`（2026-11-13 由 Apache-2.0 切换），LICENSE 正文随包；`src/chunkenc/**` 为 Prometheus 移植，仍适用 Apache-2.0，随包附带 `LICENSE-APACHE` 与 `NOTICE` |
 | 打包 | ✅ 30 文件 / 817.7 KiB（116.7 KiB 压缩），零告警；解包后 41 项测试通过 |
 | 文档注释 | ❌ 仍有 **144 处** `missing_docs`（meta 34 / index 31 / chunkenc 28 / block 12 / chunks 11 / error 10 / tombstones 8 / 其余 10）。不阻塞发布，但 `rustdoc` 会告警，且 crates.io 文档页会大量留白 |
 | 编译特性 | ⚠️ 无 `[features]`。`memmap2` / `crc32c` / `serde_json` 为硬依赖，无法裁剪，也不支持 wasm/`no_std`。不阻塞发布 |
@@ -282,11 +282,11 @@ readme = "README.md"
 keywords = ["prometheus", "tsdb", "metrics", "parser", "zero-copy"]
 categories = ["parser-implementations", "database", "encoding"]
 rust-version = "1.77"
-license = "Apache-2.0"
+license = "MIT"
 include = ["src/**", "tests/**", "README.md", "LICENSE", "Cargo.toml"]
 ```
 
-- 包内**没有 LICENSE 文件**：`license = "Apache-2.0"` 满足 crates.io 的校验，但 tarball 缺少许可正文。建议在 crate 目录放一份 `LICENSE`（或 `license-file` 指向 `../../LICENSE`，但该路径不会被拷入包内，必须实拷）。
+- 包内**必须自带许可正文**：`license = "MIT"` 只满足 crates.io 的字段校验，tarball 仍需实拷 `LICENSE`。移植自 Prometheus 的 `chunkenc/**` 另需 `LICENSE-APACHE` 与 `NOTICE`，三者都要进 `include` 列表。
 - `keywords` 最多 5 个、`categories` 必须取自 crates.io 白名单。
 - 若发布到组织账号，`authors` 可省略（crates.io 用账号信息）。
 

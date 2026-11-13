@@ -40,8 +40,23 @@ fn manifest_carries_the_publish_metadata() {
 }
 
 #[test]
+fn the_license_is_mit() {
+    let text = std::fs::read_to_string(crate_dir().join("LICENSE")).unwrap();
+    assert!(
+        text.starts_with("MIT License"),
+        "LICENSE must be the MIT text"
+    );
+    assert!(text.contains("Permission is hereby granted, free of charge"));
+    // The ported decoders keep their upstream license next to ours.
+    let apache = std::fs::read_to_string(crate_dir().join("LICENSE-APACHE")).unwrap();
+    assert!(apache.contains("Apache License"));
+    let notice = std::fs::read_to_string(crate_dir().join("NOTICE")).unwrap();
+    assert!(notice.contains("Prometheus"));
+}
+
+#[test]
 fn readme_and_licence_ship_with_the_crate() {
-    for name in ["README.md", "LICENSE"] {
+    for name in ["README.md", "LICENSE", "LICENSE-APACHE", "NOTICE"] {
         let path: PathBuf = crate_dir().join(name);
         assert!(path.is_file(), "{name} is missing from the crate root");
         let size = std::fs::metadata(&path).unwrap().len();

@@ -135,4 +135,8 @@ The fixture ships inside the crate (`tests/data`) so the tests also run from a
 
 ## License
 
-Apache-2.0.
+MIT — see [LICENSE](LICENSE).
+
+The chunk decoders in `src/chunkenc/` are a Rust port of Prometheus' TSDB
+encoders and stay under the Apache License 2.0 (see `LICENSE-APACHE` and
+`NOTICE` for the exact file list and attribution).

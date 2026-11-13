@@ -64,7 +64,11 @@ COPY --from=builder /out/tsdb-migrate-server /usr/local/bin/tsdb-migrate-server
 
 LABEL org.opencontainers.image.title="tsdb-migrate-server" \
       org.opencontainers.image.description="HTTP control plane for tsdb-migrate" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="MIT"
+
+# Ship the license texts inside the image: MIT for this project, Apache-2.0 for
+# the Prometheus-derived chunk decoders, plus their attribution.
+COPY --chmod=0444 LICENSE LICENSE-APACHE NOTICE /usr/share/doc/tsdb-migrate/
 
 ENV RUST_LOG=info,tower_http=warn,axum=warn
 
