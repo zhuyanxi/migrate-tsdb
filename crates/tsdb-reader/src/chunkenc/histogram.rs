@@ -129,6 +129,7 @@ fn header(data: &[u8], st_encoding: bool) -> Result<Header> {
 ///
 /// `num_read` is 1-based and already includes the current sample, matching
 /// Go's `stDecoder.decode(br, it.numRead, ...)`.
+#[allow(clippy::too_many_arguments)]
 fn decode_st(
     br: &mut BitReader<'_>,
     st_known: bool,
@@ -158,7 +159,7 @@ fn decode_st(
             }
         }
         n => {
-            if change_on > 0 && n - 1 >= change_on as u64 {
+            if change_on > 0 && n > change_on as u64 {
                 let sdod = read_varbit_int(br)?;
                 if n - 1 == change_on as u64 {
                     *st_diff = sdod;

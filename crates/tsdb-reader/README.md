@@ -26,13 +26,42 @@ tools can read blocks without reimplementing the on-disk formats.
 - `no_std` or `wasm32-unknown-unknown`: the crate maps files with `memmap2` and
   relies on `std::fs`.
 
+## Cargo features
+
+All three are enabled by default. `default-features = false` leaves only
+`serde` and `thiserror`, which the type definitions need.
+
+| Feature | Default | Pulls in | Turn it off to |
+|---------|---------|----------|----------------|
+| `mmap` | on | `memmap2` | drop the memory-mapping dependency and read segments into owned buffers |
+| `crc` | on | `crc32c` | skip checksum verification entirely and drop the CRC dependency |
+| `meta` | on | `serde_json` | drop JSON parsing and supply `BlockMeta` from your own store |
+
+The features are independent: any combination compiles and is tested in CI.
+
+What changes without them:
+
+- **`mmap` off** — `IndexReader::open` and `ChunkReader::open` read files into
+  memory instead of mapping them. `IndexReader::from_bytes` and
+  `ChunkReader::from_segments` accept buffers either way, so object-store and
+  in-memory pipelines are unaffected. `IndexReader::from_mmap` only exists with
+  the feature on.
+- **`crc` off** — `ReaderOptions::verify_crc` and the `verify_crc` arguments
+  become no-ops; `Error::Checksum` is never produced. Corrupt data then surfaces
+  as a parse error, or not at all.
+- **`meta` off** — `read_meta`, `discover_blocks` and `BlockReader::open` are
+  not compiled. Use `BlockReader::open_with_meta(path, meta, opts)` or
+  `BlockReader::open_info(info, opts)` instead.
+
 ## Example
 
 ```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# #[cfg(feature = "meta")]
+# {
 use std::path::Path;
 use tsdb_reader::{BlockReader, ReaderOptions, discover_blocks};
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let blocks = discover_blocks(Path::new("/var/lib/prometheus/data"))?;
 
 for info in &blocks {
@@ -46,6 +75,7 @@ for info in &blocks {
         block.meta().max_time,
     );
 }
+# }
 # Ok(())
 # }
 ```
@@ -54,6 +84,9 @@ Decoding samples is a two-step process: walk the series, then decode each chunk
 into a sink of your own.
 
 ```rust,no_run
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# #[cfg(feature = "meta")]
+# {
 use std::path::Path;
 use tsdb_reader::chunkenc::{self, HistogramSample, SampleSink};
 use tsdb_reader::{BlockReader, ReaderOptions};
@@ -67,7 +100,6 @@ impl SampleSink for PrintSink {
     fn push_histogram(&mut self, _h: &HistogramSample<'_>) {}
 }
 
-# fn main() -> Result<(), Box<dyn std::error::Error>> {
 let block = BlockReader::open(
     Path::new("/data/01ARZ3NDEKTSV4RRFFQ69G5FAV"),
     ReaderOptions::default(),
@@ -81,6 +113,7 @@ for series in block.series(0) {
         chunkenc::decode(slice.encoding, slice.data, &mut sink)?;
     }
 }
+# }
 # Ok(())
 # }
 ```

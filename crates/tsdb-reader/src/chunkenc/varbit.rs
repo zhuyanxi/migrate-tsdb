@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 
 use super::bstream::BitReader;
 
+/// Reads a zig-zag encoded signed integer of variable bit width.
 pub fn read_varbit_int(br: &mut BitReader<'_>) -> Result<i64> {
     let mut d: u8 = 0;
     for _ in 0..8 {
@@ -45,6 +46,7 @@ pub fn read_varbit_int(br: &mut BitReader<'_>) -> Result<i64> {
     Ok(val)
 }
 
+/// Reads an unsigned integer of variable bit width.
 pub fn read_varbit_uint(br: &mut BitReader<'_>) -> Result<u64> {
     let mut d: u8 = 0;
     for _ in 0..8 {

@@ -9,9 +9,9 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
 
-use memmap2::{Mmap, MmapOptions};
-
+use crate::checksum;
 use crate::error::{Error, Result};
+use crate::storage::{self, Segment};
 use crate::varint;
 
 const MAGIC_INDEX: u32 = 0xBAAA_D700;
@@ -21,45 +21,70 @@ const SERIES_ALIGN: usize = 16;
 const SYMBOL_FACTOR: usize = 32;
 const SYMBOL_CACHE_BITS: usize = 14;
 
+/// The index table of contents: absolute file offsets of every section.
+///
+/// All values are byte offsets from the start of the index file. Sections this
+/// crate does not parse (`label_indices`, `postings`) are kept so callers can
+/// see the layout and compute section boundaries.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Toc {
+    /// Symbol table offset.
     pub symbols: u64,
+    /// Series section offset, 16-byte aligned on v2/v3.
     pub series: u64,
+    /// Label index section offset.
     pub label_indices: u64,
+    /// Label index table offset.
     pub label_indices_table: u64,
+    /// Postings section offset.
     pub postings: u64,
+    /// Postings table offset.
     pub postings_table: u64,
 }
 
+/// Where one chunk lives and which time range it covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkMeta {
     /// Packed chunk reference: high 32 bits segment index, low 32 bits offset.
     pub reference: u64,
+    /// First timestamp in the chunk, in milliseconds since the Unix epoch.
     pub min_time: i64,
+    /// Last timestamp in the chunk, in milliseconds since the Unix epoch.
     pub max_time: i64,
 }
 
 impl ChunkMeta {
+    /// Segment index encoded in [`Self::reference`].
     pub fn segment(&self) -> u32 {
         (self.reference >> 32) as u32
     }
 
+    /// Byte offset of the record inside [`Self::segment`].
     pub fn offset(&self) -> u32 {
         self.reference as u32
     }
 }
 
+/// One series: its label set and the chunks that hold its samples.
+///
+/// Despite the name this is an owned record, not a reference into the file:
+/// label strings are resolved through the symbol table once, then shared as
+/// `Arc<str>` so a caller can keep them after the iterator moves on.
 #[derive(Debug, Clone)]
 pub struct SeriesRef {
-    /// Reference as stored in the index (v2/v3: byte offset / 16).
+    /// Reference as stored in the index (v2/v3: byte offset / 16). This is the
+    /// same value tombstones use to identify a series.
     pub id: u64,
     /// Byte offset of the series record in the index file.
     pub offset: u64,
+    /// Labels in lexicographic order, exactly as stored in the index.
     pub labels: Vec<(Arc<str>, Arc<str>)>,
+    /// Chunks in ascending time order.
     pub chunks: Vec<ChunkMeta>,
 }
 
 impl SeriesRef {
+    /// Looks up a label value by name.
     pub fn label(&self, name: &str) -> Option<&str> {
         self.labels
             .iter()
@@ -68,13 +93,24 @@ impl SeriesRef {
     }
 }
 
+/// Series and chunk counts, plus the byte range they were read from.
+///
+/// [`Self::end_series_offset`] is what a resumed run stores in its checkpoint
+/// so it can continue from the same byte.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IndexStats {
+    /// Number of series records.
     pub series: u64,
+    /// Number of chunks referenced by those series.
     pub chunks: u64,
+    /// Byte offset where the series section starts.
     pub min_series_offset: u64,
+    /// Byte offset just past the last series record that was read.
     pub end_series_offset: u64,
 }
+
+/// Direct-mapped cache slot: symbol reference plus its resolved string.
+type SymbolCache = Vec<Option<(u32, Arc<str>)>>;
 
 struct Symbols {
     /// Absolute file offset of the first symbol entry.
@@ -85,7 +121,7 @@ struct Symbols {
     /// Absolute offsets of every 32nd symbol (same scheme as Prometheus).
     offsets: Vec<usize>,
     version: u8,
-    cache: RefCell<Vec<Option<(u32, Arc<str>)>>>,
+    cache: RefCell<SymbolCache>,
 }
 
 impl Symbols {
@@ -115,10 +151,12 @@ impl Symbols {
         }
         if verify {
             let want = be32(mmap, payload_end)?;
-            let got = crc32c::crc32c(&mmap[payload_start..payload_end]);
-            if want != got {
-                return Err(Error::Checksum("index symbols"));
-            }
+            checksum::verify(
+                true,
+                want,
+                &mmap[payload_start..payload_end],
+                "index symbols",
+            )?;
         }
 
         let mut offsets = Vec::with_capacity(1 + count / SYMBOL_FACTOR);
@@ -202,8 +240,14 @@ impl Symbols {
     }
 }
 
+/// Sequential reader for the index of one block.
+///
+/// Only the symbol table and the series section are parsed: a full export does
+/// not need postings, so no label index is built in memory. `IndexReader` is
+/// `Send` but not `Sync` because the symbol cache is a `RefCell`; see the crate
+/// level threading notes.
 pub struct IndexReader {
-    mmap: Mmap,
+    mmap: Segment,
     version: u8,
     toc: Toc,
     symbols: Symbols,
@@ -222,13 +266,26 @@ impl std::fmt::Debug for IndexReader {
 }
 
 impl IndexReader {
+    /// Opens and validates an `index` file.
     pub fn open(path: &Path, verify_crc: bool) -> Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-        Self::from_mmap(mmap, verify_crc)
+        Self::from_segment(storage::open(path)?, verify_crc)
     }
 
-    pub fn from_mmap(mmap: Mmap, verify_crc: bool) -> Result<Self> {
+    /// Wraps an already-mapped index file.
+    #[cfg(feature = "mmap")]
+    pub fn from_mmap(mmap: memmap2::Mmap, verify_crc: bool) -> Result<Self> {
+        Self::from_segment(storage::mapped(mmap), verify_crc)
+    }
+
+    /// Wraps an index file that is already in memory.
+    ///
+    /// Useful when the bytes come from an object store, a network stream or a
+    /// test fixture instead of the local filesystem.
+    pub fn from_bytes(bytes: Vec<u8>, verify_crc: bool) -> Result<Self> {
+        Self::from_segment(storage::owned(bytes), verify_crc)
+    }
+
+    fn from_segment(mmap: Segment, verify_crc: bool) -> Result<Self> {
         let len = mmap.len();
         if len < HEADER_LEN + TOC_LEN {
             return Err(Error::format("index file too small"));
@@ -247,10 +304,7 @@ impl IndexReader {
         let toc_off = len - TOC_LEN;
         let want = be32(&mmap, toc_off + 48)?;
         if verify_crc {
-            let got = crc32c::crc32c(&mmap[toc_off..toc_off + 48]);
-            if want != got {
-                return Err(Error::Checksum("index toc"));
-            }
+            checksum::verify(true, want, &mmap[toc_off..toc_off + 48], "index toc")?;
         }
         let toc = Toc {
             symbols: be64(&mmap, toc_off)?,
@@ -295,22 +349,27 @@ impl IndexReader {
         })
     }
 
+    /// Index format version (1, 2 or 3).
     pub fn version(&self) -> u8 {
         self.version
     }
 
+    /// Raw table of contents of the file.
     pub fn toc(&self) -> Toc {
         self.toc
     }
 
+    /// Byte offset where the series section starts, after alignment.
     pub fn series_start(&self) -> u64 {
         align_up(self.toc.series as usize, self.align()) as u64
     }
 
+    /// Byte offset where the series section ends.
     pub fn series_end(&self) -> u64 {
         self.series_end as u64
     }
 
+    /// The whole index file as bytes.
     pub fn bytes(&self) -> &[u8] {
         &self.mmap
     }
@@ -340,7 +399,10 @@ impl IndexReader {
     }
 
     /// Scans the series section without resolving symbols, collecting exact
-    /// series/chunk counts. Used when `meta.json` has no stats.
+    /// series and chunk counts.
+    ///
+    /// Use this when `meta.json` carries no stats. It walks every record but
+    /// never touches the symbol table, so it stays cheap on wide label sets.
     pub fn scan_stats(&self) -> Result<IndexStats> {
         let mut pos = self.series_start() as usize;
         let mut stats = IndexStats {
@@ -404,10 +466,12 @@ impl IndexReader {
         }
         if self.verify_crc {
             let want = be32(&self.mmap, payload_end)?;
-            let got = crc32c::crc32c(&self.mmap[payload_start..payload_end]);
-            if want != got {
-                return Err(Error::Checksum("index series"));
-            }
+            checksum::verify(
+                true,
+                want,
+                &self.mmap[payload_start..payload_end],
+                "index series",
+            )?;
         }
 
         let mut p = payload_start;
@@ -480,6 +544,10 @@ impl IndexReader {
     }
 }
 
+/// Iterator over the series section, in on-disk (label-sorted) order.
+///
+/// Yields `Result<SeriesRef>`: a malformed record stops the iteration after
+/// reporting the error, so callers can checkpoint at the last good offset.
 pub struct SeriesIter<'a> {
     index: &'a IndexReader,
     pos: usize,
@@ -492,6 +560,7 @@ impl SeriesIter<'_> {
         self.pos as u64
     }
 
+    /// True once the iterator has passed the end of the section.
     pub fn is_done(&self) -> bool {
         self.done || self.pos >= self.index.series_end
     }

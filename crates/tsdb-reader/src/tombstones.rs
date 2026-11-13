@@ -8,11 +8,17 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::checksum;
 use crate::error::{Error, Result};
 use crate::varint;
 
 const MAGIC_TOMBSTONE: u32 = 0x0130_BA30;
 
+/// Deletion intervals loaded from a block's `tombstones` file.
+///
+/// Intervals are closed (`[mint, maxt]`) and merged on load, so a timestamp is
+/// deleted if it falls inside any interval of its series. A missing file loads
+/// as an empty set, which is what most blocks have.
 #[derive(Debug, Default, Clone)]
 pub struct Tombstones {
     intervals: HashMap<u64, Vec<(i64, i64)>>,
@@ -20,10 +26,12 @@ pub struct Tombstones {
 }
 
 impl Tombstones {
+    /// An empty set: nothing is deleted.
     pub fn empty() -> Self {
         Self::default()
     }
 
+    /// Loads `dir/tombstones`, treating a missing file as empty.
     pub fn open(dir: &Path, verify_crc: bool) -> Result<Self> {
         let path = dir.join("tombstones");
         let data = match std::fs::read(&path) {
@@ -57,10 +65,7 @@ impl Tombstones {
                 data[crc_pos + 2],
                 data[crc_pos + 3],
             ]);
-            let got = crc32c::crc32c(&data[5..crc_pos]);
-            if want != got {
-                return Err(Error::Checksum("tombstones"));
-            }
+            checksum::verify(true, want, &data[5..crc_pos], "tombstones")?;
         }
 
         let mut pos = 5;
@@ -102,6 +107,7 @@ impl Tombstones {
         })
     }
 
+    /// Merged intervals for one series reference, empty if it has none.
     pub fn intervals(&self, series_ref: u64) -> &[(i64, i64)] {
         self.intervals
             .get(&series_ref)
@@ -119,19 +125,26 @@ impl Tombstones {
         self.raw_count
     }
 
+    /// Number of series that have at least one interval.
     pub fn series_count(&self) -> usize {
         self.intervals.len()
     }
 
+    /// Iterates every series reference with its merged intervals.
     pub fn iter_raw(&self) -> impl Iterator<Item = (&u64, &Vec<(i64, i64)>)> {
         self.intervals.iter()
     }
 
+    /// True when `ts` falls inside one of `series_ref`'s intervals.
     pub fn is_deleted(&self, series_ref: u64, ts: i64) -> bool {
         is_deleted(self.intervals(series_ref), ts)
     }
 }
 
+/// Tests a timestamp against an already-sorted interval list.
+///
+/// Exposed separately so callers that keep their own interval lists do not have
+/// to build a [`Tombstones`] value.
 #[inline]
 pub fn is_deleted(intervals: &[(i64, i64)], ts: i64) -> bool {
     if intervals.is_empty() {

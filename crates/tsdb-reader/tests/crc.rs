@@ -1,7 +1,9 @@
 //! Corruption handling tests for chunk segments.
 
+#![cfg(feature = "crc")]
+
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tsdb_reader::chunks::ChunkReader;
 
@@ -19,7 +21,7 @@ fn temp_dir(tag: &str) -> PathBuf {
     p
 }
 
-fn write_segment(dir: &PathBuf, bad_crc: bool) {
+fn write_segment(dir: &Path, bad_crc: bool) {
     let mut f = std::fs::File::create(dir.join("000001")).unwrap();
     // magic + version + padding
     f.write_all(&0x85BD40DDu32.to_be_bytes()).unwrap();

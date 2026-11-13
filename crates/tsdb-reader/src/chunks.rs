@@ -10,27 +10,41 @@
 
 use std::path::Path;
 
-#[cfg(unix)]
-use memmap2::Advice;
-use memmap2::{Mmap, MmapOptions};
-
+use crate::checksum;
 use crate::error::{Error, Result};
+use crate::storage::{self, Segment};
 use crate::varint;
 
 const MAGIC_CHUNKS: u32 = 0x85BD_40DD;
+/// Size of a chunk segment header: magic(4) + version(1) + padding(3).
 pub const SEGMENT_HEADER_SIZE: usize = 8;
 
+/// A zero-copy view of one chunk record inside a segment.
+///
+/// `data` borrows straight out of the mapped segment, so the slice is only
+/// valid while the owning [`ChunkReader`] is alive.
 #[derive(Debug)]
 pub struct ChunkSlice<'a> {
+    /// Chunk encoding, i.e. one of the `ENC_*` constants in [`crate::chunkenc`].
     pub encoding: u8,
+    /// Compressed chunk body, with the encoding byte already stripped.
     pub data: &'a [u8],
+    /// Segment the record lives in (the high 32 bits of a chunk reference).
     pub segment: u32,
+    /// Byte offset of the record inside that segment.
     pub offset: u32,
+    /// Length of the chunk body as stored on disk. Excludes the encoding byte
+    /// and the trailing CRC.
     pub encoded_len: u32,
 }
 
+/// A block's `chunks/` directory, one segment per numeric file.
+///
+/// With the `mmap` feature the segments are mapped lazily by the OS; without
+/// it they are held in memory. Either way [`ChunkReader::chunk`] does not
+/// allocate and returns a slice into the segment.
 pub struct ChunkReader {
-    segments: Vec<Mmap>,
+    segments: Vec<Segment>,
     verify_crc: bool,
     bytes: u64,
 }
@@ -45,6 +59,11 @@ impl std::fmt::Debug for ChunkReader {
 }
 
 impl ChunkReader {
+    /// Opens a block's `chunks/` directory.
+    ///
+    /// Segment files are ordered by their numeric name. `verify_crc` is only
+    /// honoured when the crate is built with the `crc` feature; `advise` asks
+    /// the kernel to read sequentially on unix targets.
     pub fn open(dir: &Path, verify_crc: bool, advise: bool) -> Result<Self> {
         let mut files: Vec<(u64, std::path::PathBuf)> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
@@ -63,36 +82,8 @@ impl ChunkReader {
         let mut segments = Vec::with_capacity(files.len());
         let mut bytes = 0u64;
         for (seq, path) in &files {
-            let file = std::fs::File::open(path)?;
-            let md = file.metadata()?;
-            if md.len() < SEGMENT_HEADER_SIZE as u64 {
-                return Err(Error::format(format!(
-                    "chunk segment {} too small: {}",
-                    path.display(),
-                    md.len()
-                )));
-            }
-            let mmap = unsafe { MmapOptions::new().map(&file)? };
-            let magic = u32::from_be_bytes([mmap[0], mmap[1], mmap[2], mmap[3]]);
-            if magic != MAGIC_CHUNKS {
-                return Err(Error::format(format!(
-                    "invalid chunk segment magic 0x{magic:08x} in {}",
-                    path.display()
-                )));
-            }
-            if mmap[4] != 1 {
-                return Err(Error::Unsupported(format!(
-                    "chunk segment format version {}",
-                    mmap[4]
-                )));
-            }
-            if advise {
-                #[cfg(unix)]
-                let _ = mmap.advise(Advice::Sequential);
-            }
-            bytes += mmap.len() as u64;
-            segments.push(mmap);
-            let _ = seq;
+            let segment = storage::open(path)?;
+            Self::push_segment(&mut segments, &mut bytes, *seq, segment, advise)?;
         }
         if segments.is_empty() {
             return Err(Error::format(format!(
@@ -107,10 +98,72 @@ impl ChunkReader {
         })
     }
 
+    /// Builds a reader from segments that are already in memory.
+    ///
+    /// `segments` must be ordered by sequence number, exactly like the numeric
+    /// files inside a block's `chunks/` directory. Chunk references index into
+    /// this slice, so the order is part of the format.
+    pub fn from_segments(segments: Vec<Vec<u8>>, verify_crc: bool) -> Result<Self> {
+        if segments.is_empty() {
+            return Err(Error::format("no chunk segments supplied"));
+        }
+        let mut out = Vec::with_capacity(segments.len());
+        let mut bytes = 0u64;
+        for (seq, buffer) in segments.into_iter().enumerate() {
+            Self::push_segment(
+                &mut out,
+                &mut bytes,
+                seq as u64,
+                storage::owned(buffer),
+                false,
+            )?;
+        }
+        Ok(Self {
+            segments: out,
+            verify_crc,
+            bytes,
+        })
+    }
+
+    fn push_segment(
+        segments: &mut Vec<Segment>,
+        bytes: &mut u64,
+        seq: u64,
+        segment: Segment,
+        advise: bool,
+    ) -> Result<()> {
+        if segment.len() < SEGMENT_HEADER_SIZE {
+            return Err(Error::format(format!(
+                "chunk segment {seq} too small: {} bytes",
+                segment.len()
+            )));
+        }
+        let magic = u32::from_be_bytes([segment[0], segment[1], segment[2], segment[3]]);
+        if magic != MAGIC_CHUNKS {
+            return Err(Error::format(format!(
+                "invalid chunk segment magic 0x{magic:08x} in segment {seq}"
+            )));
+        }
+        if segment[4] != 1 {
+            return Err(Error::Unsupported(format!(
+                "chunk segment format version {}",
+                segment[4]
+            )));
+        }
+        if advise {
+            storage::advise_sequential(&segment);
+        }
+        *bytes += segment.len() as u64;
+        segments.push(segment);
+        Ok(())
+    }
+
+    /// Total size of all segments in bytes.
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
+    /// Number of segment files backing this block.
     pub fn segment_count(&self) -> usize {
         self.segments.len()
     }
@@ -157,10 +210,7 @@ impl ChunkReader {
                 seg[data_end + 2],
                 seg[data_end + 3],
             ]);
-            let got = crc32c::crc32c(&seg[enc_start..data_end]);
-            if want != got {
-                return Err(Error::Checksum("chunk"));
-            }
+            checksum::verify(true, want, &seg[enc_start..data_end], "chunk")?;
         }
         Ok(ChunkSlice {
             encoding,
@@ -172,11 +222,11 @@ impl ChunkReader {
     }
 }
 
+#[cfg(all(feature = "mmap", unix))]
 impl Drop for ChunkReader {
     fn drop(&mut self) {
-        for seg in &self.segments {
-            #[cfg(unix)]
-            let _ = seg.advise(Advice::Normal);
+        for segment in &self.segments {
+            storage::advise_normal(segment);
         }
     }
 }
@@ -184,7 +234,9 @@ impl Drop for ChunkReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunkenc::{ENC_NONE, ENC_XOR, ENC_XOR2};
+    #[cfg(feature = "crc")]
+    use crate::chunkenc::ENC_XOR2;
+    use crate::chunkenc::{ENC_NONE, ENC_XOR};
     use std::io::Write;
 
     /// A chunk reference is `(segment << 32) | offset`; the first record of
@@ -256,6 +308,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(feature = "crc")]
     #[test]
     fn crc_covers_encoding_and_data() {
         let mut seg = segment_with(ENC_XOR2, &[9, 8, 7]);

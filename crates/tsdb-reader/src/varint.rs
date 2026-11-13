@@ -6,6 +6,7 @@
 
 use crate::error::{Error, Result};
 
+/// Maximum bytes a 64-bit varint can occupy.
 pub const MAX_VARINT_LEN: usize = 10;
 
 /// Reads an unsigned LEB128 varint, advancing `pos`.

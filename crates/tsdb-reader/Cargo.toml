@@ -13,15 +13,30 @@ categories = ["database", "database-implementations", "encoding"]
 rust-version = "1.77"
 include = ["src/**", "tests/**", "README.md", "LICENSE", "Cargo.toml"]
 
+[features]
+default = ["mmap", "crc", "meta"]
+# File-backed memory mapping. Turn it off to build without `memmap2`; the
+# readers fall back to loading segments into memory. `IndexReader::from_bytes`
+# and `ChunkReader::from_segments` work with or without this feature.
+mmap = ["dep:memmap2"]
+# CRC32C verification of the index, chunk segments and tombstones. Turn it off
+# to drop `crc32c`; `ReaderOptions::verify_crc` then becomes a no-op.
+crc = ["dep:crc32c"]
+# `meta.json` parsing: `read_meta`, `discover_blocks` and `BlockReader::open`.
+# Turn it off to drop `serde_json` and pass a `BlockMeta` yourself through
+# `BlockReader::open_with_meta`.
+meta = ["dep:serde_json"]
+
 [dependencies]
-memmap2.workspace = true
-crc32c.workspace = true
+memmap2 = { workspace = true, optional = true }
+crc32c = { workspace = true, optional = true }
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
 crc32c.workspace = true
+serde_json.workspace = true
 
 [package.metadata.docs.rs]
 all-features = true

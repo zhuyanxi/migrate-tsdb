@@ -136,7 +136,7 @@ impl State {
             }
             return Ok(());
         }
-        if self.first_st_change_on > 0 && num_read - 1 >= self.first_st_change_on as u64 {
+        if self.first_st_change_on > 0 && num_read > self.first_st_change_on as u64 {
             let sdod = read_varbit_int(br)?;
             if num_read - 1 == self.first_st_change_on as u64 {
                 self.st_diff = sdod;
@@ -149,6 +149,7 @@ impl State {
     }
 }
 
+/// Decodes an XOR2 chunk body, returning the number of float samples.
 pub fn decode<S: SampleSink>(data: &[u8], sink: &mut S) -> Result<u64> {
     if data.len() < CHUNK_HEADER_SIZE + ST_HEADER_SIZE {
         return Err(Error::decode("XOR2 chunk shorter than header"));

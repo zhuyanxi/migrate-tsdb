@@ -33,6 +33,23 @@
 
 结论：**修正 `rust-version` 后即可发布**；144 处文档缺口建议在 0.2.0 之前补齐。
 
+### 0.3 2026-11-13 P1 部分落地：文档与特性开关
+
+| 项 | 结果 |
+|----|------|
+| `missing_docs` | 144 → **0**。`lib.rs` 开启 `#![deny(missing_docs)]` 与 `#![deny(rustdoc::broken_intra_doc_links)]` |
+| 公开项文档批次 | ①`meta.rs`(34) + `index.rs`(31)：数据结构、TOC/series 语义、外键说明；②`chunkenc/*`(36)：位流、varbit、编码常量、直方图样本生命周期；③句柄与错误 `block.rs`(12) + `chunks.rs`(11) + `error.rs`(10) + `tombstones.rs`(8) + `varint.rs`(1)。每批编译 + `cargo rustdoc` 验证后再推进 |
+| feature 开关 | 新增 `default = ["mmap", "crc", "meta"]`；`mmap → dep:memmap2`、`crc → dep:crc32c`、`meta → dep:serde_json`。三者相互独立，8 种组合均可编译并通过测试 |
+| 条件编译边界 | `mmap`：`Segment::{Mapped,Owned}` 抽象 + `IndexReader::from_mmap` 仅在开启时存在；`crc`：`checksum::verify` 空实现；`meta`：`read_meta`/`discover_blocks`/`BlockReader::open` 整体移除，新增 `open_with_meta` 兜底 |
+| 非文件后端 | 新增 `IndexReader::from_bytes` 与 `ChunkReader::from_segments`，两种特性配置下都可用 |
+| clippy | 5 条历史告警清零（`too_many_arguments` 显式 allow、`SymbolCache` 类型别名、两处 `x - 1 >=` 化简、测试签名 `&Path`） |
+
+测试：`tsdb-reader` 41 → **44** 项（默认特性），无特性构建 33 项；8 种特性组合 0 失败 0 告警。
+打包：32 文件 / 839.7 KiB（123.1 KiB 压缩），零告警；解包后默认特性 44 项、`--no-default-features` 33 项全部通过。
+
+至此 §12 的 P1-6（`#[non_exhaustive]` 部分）、P1-8、P1-9、P1-11（CI 除外）已完成；P1-7（错误类型重构）、P1-10（`Sync` 化）、P1-12（chunkenc 畸形输入测试）仍待办。
+
+
 
 
 ---
@@ -44,9 +61,9 @@
 | crate 名 `tsdb-reader` | crates.io 返回 404，**可用** | ✅ |
 | `cargo package` | 通过（20 文件，97 KiB / 23.7 KiB 压缩） | ✅ |
 | 打包产物内 `cargo test` | 41 项全部通过（fixture 随包发布） | ✅ |
-| `cargo test --doc` | 2 个（README 示例，经 `#![doc = include_str!]` 引入） | ✅ |
-| `missing_docs` 警告 | 145 条（P1-8 待处理） | ❌ |
-| `clippy` | 9 条，全部为历史遗留（lib 4 条）；新增代码 0 条 | ⚠️ |
+| `cargo test --doc` | 2 个（README 示例，随 `meta` 特性条件编译） | ✅ |
+| `missing_docs` 警告 | **0**（`#![deny(missing_docs)]` 已开启） | ✅ |
+| `clippy` | **0** 条（`--all-targets`，含 `--no-default-features`） | ✅ |
 | `cargo fmt --check` | 通过 | ✅ |
 | Cargo.toml 元数据 | description/repository/homepage/documentation/readme/keywords/categories/rust-version/docs.rs 均齐备 | ✅ |
 | 包内 README / LICENSE | 均已随包，`readme = "README.md"` | ✅ |

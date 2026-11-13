@@ -5,9 +5,15 @@ use std::path::{Path, PathBuf};
 use crate::chunks::{ChunkReader, ChunkSlice};
 use crate::error::{Error, Result};
 use crate::index::{ChunkMeta, IndexReader, IndexStats, SeriesIter};
-use crate::meta::{read_meta, BlockInfo, BlockMeta};
+#[cfg(feature = "meta")]
+use crate::meta::read_meta;
+use crate::meta::{BlockInfo, BlockMeta};
 use crate::tombstones::Tombstones;
 
+/// Knobs applied when opening a block.
+///
+/// The defaults are what you want for a normal export: checksums on, sequential
+/// read-ahead on.
 #[derive(Debug, Clone, Copy)]
 pub struct ReaderOptions {
     /// Validate CRC32C checksums for index TOC, series records, chunks and
@@ -26,6 +32,15 @@ impl Default for ReaderOptions {
     }
 }
 
+/// A block opened for reading: index, chunk segments and tombstones.
+///
+/// The reader owns the underlying mappings or buffers. On unix with the `mmap`
+/// feature the files stay mapped for the lifetime of the reader, which means
+/// they must not be truncated by another process while it is in use.
+///
+/// `BlockReader` is `Send` but not `Sync`: the symbol cache is a `RefCell`, so
+/// index traversal belongs to one thread. Chunk segments are shared freely via
+/// [`BlockReader::chunk_reader`] or [`BlockReader::into_parts`].
 pub struct BlockReader {
     info: BlockInfo,
     index: IndexReader,
@@ -34,6 +49,12 @@ pub struct BlockReader {
 }
 
 impl BlockReader {
+    /// Opens a block directory: parses `meta.json`, then the index, chunk
+    /// segments and tombstones.
+    ///
+    /// Available with the `meta` feature. Without it, use
+    /// [`BlockReader::open_with_meta`] or [`BlockReader::open_info`].
+    #[cfg(feature = "meta")]
     pub fn open(path: &Path, opts: ReaderOptions) -> Result<Self> {
         let meta_path = path.join("meta.json");
         if !meta_path.is_file() {
@@ -42,7 +63,15 @@ impl BlockReader {
                 path.display()
             )));
         }
-        let mut meta = read_meta(&meta_path)?;
+        let meta = read_meta(&meta_path)?;
+        Self::open_with_meta(path, meta, opts)
+    }
+
+    /// Opens a block whose `meta.json` the caller already parsed.
+    ///
+    /// This is the entry point for builds without the `meta` feature and for
+    /// callers that keep block metadata in their own store.
+    pub fn open_with_meta(path: &Path, mut meta: BlockMeta, opts: ReaderOptions) -> Result<Self> {
         if meta.ulid.is_empty() {
             meta.ulid = path
                 .file_name()
@@ -85,7 +114,7 @@ impl BlockReader {
     /// overwritten. Only the byte counts measured while opening are refreshed,
     /// and `meta` is filled from disk when the caller left its ULID empty.
     pub fn open_info(info: BlockInfo, opts: ReaderOptions) -> Result<Self> {
-        let mut reader = Self::open(&info.path, opts)?;
+        let mut reader = Self::open_with_meta(&info.path, info.meta.clone(), opts)?;
         let mut merged = info;
         merged.index_bytes = reader.info.index_bytes;
         merged.chunks_bytes = reader.info.chunks_bytes;
@@ -98,43 +127,57 @@ impl BlockReader {
         Ok(reader)
     }
 
+    /// Directory this block was opened from.
     pub fn path(&self) -> &Path {
         &self.info.path
     }
 
+    /// Metadata plus the sizes measured when the block was opened.
     pub fn info(&self) -> &BlockInfo {
         &self.info
     }
 
+    /// Parsed `meta.json`.
     pub fn meta(&self) -> &BlockMeta {
         &self.info.meta
     }
 
+    /// Block ULID, taken from `meta.json` or the directory name.
     pub fn block_id(&self) -> &str {
         &self.info.meta.ulid
     }
 
+    /// The index reader backing this block.
     pub fn index(&self) -> &IndexReader {
         &self.index
     }
 
+    /// Deletion intervals loaded for this block.
     pub fn tombstones(&self) -> &Tombstones {
         &self.tombstones
     }
 
+    /// Iterates series in lexicographic label order.
+    ///
+    /// `start_offset` is a byte offset previously reported by
+    /// [`crate::SeriesIter::position`]; pass `0` to start at the beginning.
     pub fn series(&self, start_offset: u64) -> SeriesIter<'_> {
         self.index.series(start_offset)
     }
 
+    /// Reads the chunk described by `meta`, verifying its checksum when the
+    /// reader was opened with `verify_crc`.
     pub fn chunk(&self, meta: &ChunkMeta) -> Result<ChunkSlice<'_>> {
         self.chunks.chunk(meta.reference)
     }
 
     /// Shared chunk reader for decode workers (immutable, thread-safe).
+    /// Shared chunk reader, safe to hand to several decode threads.
     pub fn chunk_reader(&self) -> &ChunkReader {
         &self.chunks
     }
 
+    /// Total size of the chunk segments in bytes.
     pub fn chunk_bytes(&self) -> u64 {
         self.chunks.bytes()
     }
@@ -195,7 +238,7 @@ pub fn block_dir(root: &Path, ulid: &str) -> PathBuf {
     root.join(ulid)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "meta"))]
 mod tests {
     use super::*;
     use crate::meta::{BlockMeta, BlockMetaCompaction, BlockStats};
@@ -241,17 +284,18 @@ mod tests {
 
     #[test]
     fn open_info_falls_back_to_the_directory_name() {
-        let direct = BlockReader::open(&fixture_block_dir(), ReaderOptions::default()).unwrap();
         let info = info_with("", false, "");
         let reader = BlockReader::open_info(info, ReaderOptions::default()).unwrap();
 
         assert_eq!(
             reader.block_id(),
             "01M70C8VV61N5H5VWXB17HQQ1R",
-            "an empty ULID must be taken from meta.json"
+            "an empty ULID must be taken from the directory name"
         );
-        assert_eq!(reader.meta().version, direct.meta().version);
-        assert_eq!(reader.meta().min_time, direct.meta().min_time);
+        // The rest of the caller's meta is authoritative, even when meta.json
+        // on disk says something else.
+        assert_eq!(reader.meta().version, 2);
+        assert_eq!(reader.meta().min_time, 0);
     }
 
     #[test]

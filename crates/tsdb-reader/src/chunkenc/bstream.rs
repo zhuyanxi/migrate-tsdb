@@ -7,6 +7,12 @@
 
 use crate::error::{Error, Result};
 
+/// MSB-first bit reader with the same semantics as Prometheus'
+/// `chunkenc.bstreamReader`.
+///
+/// Bits are consumed from the most significant end of each byte. Every read
+/// either succeeds or reports [`crate::Error::Eof`]; a truncated chunk never
+/// yields partially valid values.
 pub struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -15,6 +21,7 @@ pub struct BitReader<'a> {
 }
 
 impl<'a> BitReader<'a> {
+    /// Wraps a chunk body. Nothing is read until the first call.
     pub fn new(data: &'a [u8]) -> Self {
         Self {
             data,
@@ -25,6 +32,7 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline]
+    /// Upper bound on the bits still available, including buffered ones.
     pub fn bits_left_hint(&self) -> usize {
         self.data.len().saturating_sub(self.pos) * 8 + self.valid as usize
     }
@@ -64,6 +72,7 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline]
+    /// Reads a single bit.
     pub fn read_bit(&mut self) -> Result<bool> {
         if self.valid == 0 && self.load_next(1) == 0 {
             return Err(Error::Eof(self.pos));
@@ -73,6 +82,10 @@ impl<'a> BitReader<'a> {
     }
 
     #[inline]
+    /// Reads `nbits` (0-64) bits into the low bits of the result.
+    ///
+    /// Returns [`crate::Error::Decode`] for `nbits > 64` and
+    /// [`crate::Error::Eof`] when the stream ends mid-read.
     pub fn read_bits(&mut self, nbits: u8) -> Result<u64> {
         if nbits == 0 {
             return Ok(0);
