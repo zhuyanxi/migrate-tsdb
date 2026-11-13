@@ -17,6 +17,23 @@
 
 测试总量：`tsdb-reader` 由 17 项（13 单测 + 4 集成）增至 **41 项**（30 单测 + 9 集成 + 2 文档测试）。
 
+### 0.2 2026-11-13 发布前复核
+
+在 P0 修复之后重新做了一轮发布核对，发现并修正一处**会误导使用者的元数据错误**：
+
+| 项 | 结论 |
+|----|------|
+| `rust-version = "1.70"` | ❌ 低于依赖下界。`thiserror 2.0.21` 要求 1.77，`serde_json 1.0.154` / `serde_derive 1.0.229` / `proc-macro2` 要求 1.71。1.70–1.76 的用户会拿到构建失败。已改为 **1.77**，并在 1.77.0 工具链上实测 `cargo build` + 41 项测试全部通过 |
+| crate 名 | ✅ `tsdb-reader`、`tsdb_reader`、`prom-tsdb` 在 crates.io 均 404（可用）；`tsdb` 已存在但不构成同名/规范化冲突 |
+| 版本号 | ✅ 0.1.0 从未发布，无需避让 |
+| 许可证 | ✅ `Apache-2.0`，LICENSE 正文 11357 B 随包；依赖子树 19 个包的 license 均为 MIT OR Apache-2.0 |
+| 打包 | ✅ 30 文件 / 817.7 KiB（116.7 KiB 压缩），零告警；解包后 41 项测试通过 |
+| 文档注释 | ❌ 仍有 **144 处** `missing_docs`（meta 34 / index 31 / chunkenc 28 / block 12 / chunks 11 / error 10 / tombstones 8 / 其余 10）。不阻塞发布，但 `rustdoc` 会告警，且 crates.io 文档页会大量留白 |
+| 编译特性 | ⚠️ 无 `[features]`。`memmap2` / `crc32c` / `serde_json` 为硬依赖，无法裁剪，也不支持 wasm/`no_std`。不阻塞发布 |
+
+结论：**修正 `rust-version` 后即可发布**；144 处文档缺口建议在 0.2.0 之前补齐。
+
+
 
 ---
 
@@ -168,7 +185,7 @@ target/package/tsdb-reader-0.1.0$ cargo test
 | 依赖数量 | 5 个直接依赖（memmap2/crc32c/serde/serde_json/thiserror） | 合理；按 §5 收敛 |
 | `dev-dependencies` 重复声明 `crc32c` | 与 `[dependencies]` 完全重复 | 删除 |
 | 版本约束 | 全部宽松主版本（`0.9`/`0.6`/`1`/`2`） | 保持；建议加 `Cargo.lock` 到 CI 的 `-Z minimal-versions` 检查 |
-| MSRV | 未声明 `rust-version` | 代码无 1.65+ 特性，可声明 `rust-version = "1.70"`（留余量）并在 CI 用该版本构建 |
+| MSRV | 已声明 `rust-version = "1.77"` | 由依赖下界决定：`thiserror 2.0.21` 要求 1.77，`serde_json`/`serde_derive`/`proc-macro2` 要求 1.71。已在 1.77.0 工具链上实测 `build` + 41 项测试通过 |
 | workspace 继承 | `version.workspace = true` 等 | 发布时 cargo 会自动展开，无需改动；但 `description` 等元数据建议写在 crate 本地而非 workspace |
 | 许可合规 | 依赖均为 Apache-2.0/MIT 兼容 | CI 加 `cargo deny check licenses advisories` |
 
@@ -247,7 +264,7 @@ documentation = "https://docs.rs/tsdb-reader"
 readme = "README.md"
 keywords = ["prometheus", "tsdb", "metrics", "parser", "zero-copy"]
 categories = ["parser-implementations", "database", "encoding"]
-rust-version = "1.70"
+rust-version = "1.77"
 license = "Apache-2.0"
 include = ["src/**", "tests/**", "README.md", "LICENSE", "Cargo.toml"]
 ```

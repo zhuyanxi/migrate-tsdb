@@ -10,7 +10,7 @@ documentation = "https://docs.rs/tsdb-reader"
 readme = "README.md"
 keywords = ["prometheus", "tsdb", "metrics", "parser", "time-series"]
 categories = ["database", "database-implementations", "encoding"]
-rust-version = "1.70"
+rust-version = "1.77"
 include = ["src/**", "tests/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
