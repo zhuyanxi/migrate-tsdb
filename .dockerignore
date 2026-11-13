@@ -1,0 +1,11 @@
+# Build context hygiene. Keep web/ - the server embeds it at compile time.
+.git
+.gitignore
+target
+docs
+fixtures
+scripts
+plan.md
+.openidea
+**/*.exe
+**/.DS_Store
