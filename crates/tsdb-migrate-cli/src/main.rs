@@ -130,6 +130,39 @@ struct MigrateArgs {
     duckdb_path: Option<String>,
     #[arg(long)]
     no_duckdb_exec: bool,
+    /// DuckDB memory cap for the load step, in MiB.
+    #[arg(long, default_value_t = 24576)]
+    duckdb_memory_limit_mb: u64,
+    /// Budget for the DuckDB load temporary data (.duckdb_stage staging + spill),
+    /// in MiB; 0 disables it.
+    #[arg(long, default_value_t = 204800)]
+    duckdb_stage_limit_mb: u64,
+    /// Optional cap for the whole load including the database being written, in
+    /// MiB; 0 (default) leaves the database unbounded.
+    #[arg(long, default_value_t = 0)]
+    duckdb_disk_limit_mb: u64,
+    /// Threads for the DuckDB load step; 0 keeps DuckDB's default.
+    #[arg(long, default_value_t = 0)]
+    duckdb_threads: usize,
+    /// Directory for DuckDB spill files (default: <out>/.duckdb_stage/.spill).
+    #[arg(long, default_value = "")]
+    duckdb_temp_dir: String,
+    /// Load metric tables in batches of N, deleting each batch's staging files
+    /// right after (0 = one process for everything).
+    #[arg(long, default_value_t = 0)]
+    duckdb_metric_batch: usize,
+    /// Delete the Parquet export once staging is done (frees one copy; the data
+    /// then only lives inside DuckDB).
+    #[arg(long)]
+    duckdb_drop_export: bool,
+    /// Stage and load one block at a time: each block's staging (and export) is
+    /// removed before the next one starts.
+    #[arg(long)]
+    duckdb_chunk_by_block: bool,
+    /// One DuckDB file per time window of this many minutes (e.g. 60 = hourly),
+    /// named <YYYY-MM-DDTHH>-<original name> and built in timestamp order.
+    #[arg(long, default_value_t = 0)]
+    duckdb_window_minutes: u64,
     #[arg(long, help = "Prometheus Remote Write endpoint URL")]
     remote_write_url: Option<String>,
     #[arg(long, default_value = "X-Scope-OrgID")]
@@ -257,6 +290,29 @@ struct VerifyArgs {
 struct DuckdbLoadArgs {
     #[arg(long)]
     out: PathBuf,
+    /// DuckDB memory cap for the load step, in MiB.
+    #[arg(long, default_value_t = 24576)]
+    memory_limit_mb: u64,
+    /// Budget for the load temporary data (.duckdb_stage staging + spill), in MiB;
+    /// 0 disables it.
+    #[arg(long, default_value_t = 204800)]
+    stage_limit_mb: u64,
+    /// Optional cap for the whole load including the database being written, in
+    /// MiB; 0 (default) leaves the database unbounded.
+    #[arg(long, default_value_t = 0)]
+    disk_limit_mb: u64,
+    /// Threads for the DuckDB load step; 0 keeps DuckDB's default.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+    /// One DuckDB file per time window of this many minutes (0 = single file).
+    #[arg(long, default_value_t = 0)]
+    window_minutes: u64,
+    /// Load metric tables in batches of N, reclaiming staging per batch.
+    #[arg(long, default_value_t = 0)]
+    metric_batch: usize,
+    /// Stage and load one block at a time.
+    #[arg(long)]
+    chunk_by_block: bool,
     /// DB file for a Prometheus export, or DB directory for a multi-tenant Mimir export.
     #[arg(long)]
     db: Option<PathBuf>,
@@ -518,6 +574,15 @@ fn cmd_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
         row_group_size: args.row_group_size,
         duckdb_path: args.duckdb_path.clone().unwrap_or_default(),
         duckdb_exec: !args.no_duckdb_exec,
+        duckdb_memory_limit_mb: args.duckdb_memory_limit_mb,
+        duckdb_stage_limit_mb: args.duckdb_stage_limit_mb,
+        duckdb_disk_limit_mb: args.duckdb_disk_limit_mb,
+        duckdb_threads: args.duckdb_threads,
+        duckdb_temp_dir: args.duckdb_temp_dir.clone(),
+        duckdb_metric_batch: args.duckdb_metric_batch,
+        duckdb_drop_export: args.duckdb_drop_export,
+        duckdb_chunk_by_block: args.duckdb_chunk_by_block,
+        duckdb_window_minutes: args.duckdb_window_minutes,
         remote_write_url: args.remote_write_url.unwrap_or_default(),
         remote_write_tenant_header: args.remote_write_tenant_header,
     };
@@ -894,15 +959,29 @@ fn cmd_duckdb_load(args: DuckdbLoadArgs) -> Result<(), Box<dyn std::error::Error
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let plans = migrate_core::duckdb::plan(&args.out, &configured)?;
+    let sink = migrate_core::config::SinkConfig {
+        duckdb_path: configured,
+        duckdb_memory_limit_mb: args.memory_limit_mb,
+        duckdb_stage_limit_mb: args.stage_limit_mb,
+        duckdb_disk_limit_mb: args.disk_limit_mb,
+        duckdb_threads: args.threads,
+        duckdb_window_minutes: args.window_minutes,
+        duckdb_metric_batch: args.metric_batch,
+        duckdb_chunk_by_block: args.chunk_by_block,
+        ..Default::default()
+    };
+    let plans = migrate_core::duckdb::plan_with_sink(&args.out, &sink)?;
     for p in &plans {
         let scope = match &p.tenant {
             Some(t) => format!("tenant={t}"),
             None => "prometheus".to_string(),
         };
         println!(
-            "[{scope}] metrics={} sql={} db={}",
+            "[{scope}] metrics={} samples={} est_db={:.1}GiB budget={:.0}GiB sql={} db={}",
             p.metrics,
+            p.samples,
+            p.estimated_db_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+            p.limits.disk_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
             p.sql_path.display(),
             p.db_path.display()
         );

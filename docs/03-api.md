@@ -137,7 +137,9 @@ GET /api/blocks?data_dir=<path>&scan=<bool>&limit=<n>
     "force_path_style": false
   },
   "filter": {"min_time": null, "max_time": null, "matchers": []},
-  "sink": {"kind": "parquet", "compression": "zstd"},
+  "sink": {"kind": "duckdb", "compression": "zstd",
+           "duckdb_memory_limit_mb": 24576, "duckdb_disk_limit_mb": 204800,
+           "duckdb_threads": 0, "duckdb_temp_dir": ""},
   "options": {"block_parallel": 2, "decode_workers": 4, "unit_series": 50000}
 }
 ```

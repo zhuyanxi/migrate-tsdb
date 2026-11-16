@@ -422,6 +422,9 @@ export AWS_REGION=us-east-1
   的停滞检测。若必须限制单请求时长（例如限制总带宽的代理），注意它覆盖整个响应体，
   大对象会被腰斩成 `request or response body error`。
 - 连续零进展 `--mimir-download-retries`（默认 20）次后才放弃该对象。
+- DuckDB 装载阶段默认限 **24 GiB 内存 / 200 GiB 磁盘**（`--duckdb-memory-limit-mb`、`--duckdb-disk-limit-mb`）：
+  内存由 DuckDB 的 `memory_limit` 硬保证（超出则溢写），磁盘预算由装载器每 500 ms 校验，超限即中止且不发布数据库。
+  溢写目录默认 `<out>/.duckdb_stage/.spill`，可用 `--duckdb-temp-dir` 指到大盘。
 
 ### 7.4 API / Web
 

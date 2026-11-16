@@ -295,13 +295,16 @@ impl Engine {
         if state == JobState::Completed
             && !matches!(self.cfg.sink.kind, SinkKind::Ndjson | SinkKind::RemoteWrite)
         {
-            match crate::duckdb::plan(&self.cfg.output_dir, &self.cfg.sink.duckdb_path) {
+            match crate::duckdb::plan_with_sink(&self.cfg.output_dir, &self.cfg.sink) {
                 Ok(plans) => {
                     for p in &plans {
-                        let scope = match &p.tenant {
+                        let mut scope = match &p.tenant {
                             Some(t) => format!("tenant {t}"),
                             None => "Prometheus".to_string(),
                         };
+                        if let Some(window) = p.window {
+                            scope = format!("{scope} window {window}");
+                        }
                         self.events.log(
                             LogLevel::Info,
                             &format!(
@@ -310,6 +313,28 @@ impl Engine {
                                 p.sql_path.display()
                             ),
                         );
+                        // Capacity plan: the database itself is the floor for the
+                        // disk budget, so surface the estimate before the load runs.
+                        let estimate = p.estimated_db_bytes();
+                        self.events.log(
+                            if estimate > p.limits.disk_bytes {
+                                LogLevel::Warn
+                            } else {
+                                LogLevel::Info
+                            },
+                            &format!(
+                                "DuckDB [{scope}]: samples={} → 预计数据库 ~{:.1} GiB（按 22 B/样本估算），磁盘预算 {:.0} GiB，staging 压缩 zstd",
+                                p.samples,
+                                estimate as f64 / (1024.0 * 1024.0 * 1024.0),
+                                p.limits.disk_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+                            ),
+                        );
+                        if estimate > p.limits.disk_bytes {
+                            self.events.log(
+                                LogLevel::Warn,
+                                "  磁盘预算小于预计数据库大小：装载会在 watchdog 处中止。请调大 sink.duckdb_disk_limit_mb，或改用 parquet sink 直接查询",
+                            );
+                        }
                         if !p.warnings.is_empty() {
                             self.events.log(
                                 LogLevel::Warn,

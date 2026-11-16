@@ -186,6 +186,12 @@
             <div class="kv"><span class="k">开始时间</span><span class="v" id="cfgStarted">—</span></div>
           </div>
         </div>
+        <div class="section" style="margin-bottom:0">
+          <div class="section-head"><h2>DuckDB 产物</h2></div>
+          <div class="info-panel" id="artifactList" style="border:0;height:auto;max-height:220px;overflow:auto">
+            <div class="faint">加载中…</div>
+          </div>
+        </div>
       </div>
     </div>
   </main>
@@ -296,6 +302,38 @@
           <label for="fRemoteWriteTenantHeader">Tenant Header</label>
           <input type="text" id="fRemoteWriteTenantHeader" value="X-Scope-OrgID" placeholder="留空表示不发送">
           <div class="hint">Remote Write v1.0 使用 Snappy；Bearer token 使用 TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN 环境变量。v1.0 不支持 native histogram。</div>
+        </div>
+
+        <div class="duckdb-fields hidden" id="duckdbFields">
+          <label>DuckDB 装载</label>
+          <div class="row-2">
+            <input type="number" id="fDuckdbWindowMinutes" value="0" min="0" max="1440" step="60" title="duckdb_window_minutes">
+            <input type="number" id="fDuckdbThreads" value="0" min="0" max="128" title="duckdb_threads">
+          </div>
+          <div class="hint">window_minutes：0=单个库；60=每小时一个库（文件名前缀 YYYY-MM-DDTHH，按时间顺序装载）· threads：0=DuckDB 默认</div>
+
+          <div class="row-2">
+            <input type="number" id="fDuckdbMemoryLimitMb" value="24576" min="256" step="1024" title="duckdb_memory_limit_mb">
+            <input type="number" id="fDuckdbStageLimitMb" value="204800" min="0" step="1024" title="duckdb_stage_limit_mb">
+          </div>
+          <div class="hint">memory_limit_mb：内存硬上限（超出溢写）· stage_limit_mb：.duckdb_stage 临时数据上限，0=不限</div>
+
+          <div class="row-2">
+            <input type="number" id="fDuckdbMetricBatch" value="0" min="0" step="100" title="duckdb_metric_batch">
+            <input type="number" id="fDuckdbDiskLimitMb" value="0" min="0" step="1024" title="duckdb_disk_limit_mb">
+          </div>
+          <div class="hint">metric_batch：每批建表数，建完即回收 staging（0=一次建完）· disk_limit_mb：含数据库的总量上限，0=不限</div>
+
+          <input type="text" id="fDuckdbTempDir" placeholder="溢写目录（可选，默认 &lt;out&gt;/.duckdb_stage/.spill）">
+
+          <div class="row-2">
+            <label class="faint" style="display:flex;align-items:center;gap:6px;font-size:11px">
+              <input type="checkbox" class="checkbox" id="fDuckdbChunkByBlock"> 按 block 分批 staging
+            </label>
+            <label class="faint" style="display:flex;align-items:center;gap:6px;font-size:11px">
+              <input type="checkbox" class="checkbox" id="fDuckdbDropExport"> 装载后删除 parquet 导出
+            </label>
+          </div>
         </div>
 
         <label>并行度</label>

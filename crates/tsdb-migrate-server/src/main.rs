@@ -147,6 +147,7 @@ async fn main() {
         .route("/api/jobs/{id}/actions", post(api::job_action))
         .route("/api/jobs/{id}/blocks", get(api::job_blocks))
         .route("/api/jobs/{id}/logs", get(api::job_logs))
+        .route("/api/jobs/{id}/artifacts", get(api::job_artifacts))
         .fallback(static_handler)
         .with_state(app_state.clone())
         .layer(middleware::from_fn_with_state(app_state.clone(), auth))

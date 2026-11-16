@@ -466,6 +466,73 @@ pub async fn job_blocks(
     })))
 }
 
+/// Lists the DuckDB artifacts a job produced: one `*.duckdb` per time window
+/// when windowing is on, plus the generated load SQL. Read-only and bounded.
+pub async fn job_artifacts(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let handle = get_handle(&state, &id)?;
+    let out = handle.config.output_dir.clone();
+    let mut files = Vec::new();
+    collect_artifacts(&out, &mut files, 0);
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let total_bytes: u64 = files.iter().map(|f| f.bytes).sum();
+    Ok(Json(json!({
+        "output_dir": out.display().to_string(),
+        "total_bytes": total_bytes,
+        "files": files,
+    })))
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ArtifactFile {
+    path: String,
+    name: String,
+    bytes: u64,
+    modified_ms: i64,
+}
+
+fn collect_artifacts(dir: &Path, out: &mut Vec<ArtifactFile>, depth: usize) {
+    if depth > 3 || out.len() >= 2000 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            // Only a couple of levels are interesting (duckdb/, blocks/ is huge).
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "blocks" || name == ".state" || name == ".cache" {
+                continue;
+            }
+            collect_artifacts(&path, out, depth + 1);
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let wanted = name.ends_with(".duckdb")
+            || (name.contains("load_duckdb") && name.ends_with(".sql"))
+            || name.ends_with(".duckdb.tmp");
+        if !wanted {
+            continue;
+        }
+        out.push(ArtifactFile {
+            path: path.display().to_string(),
+            name,
+            bytes: meta.len(),
+            modified_ms: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        });
+    }
+}
+
 fn ratio(done: u64, total: u64) -> f32 {
     if total == 0 {
         0.0
