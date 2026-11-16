@@ -330,9 +330,16 @@ pub async fn delete_job(
             "job is active; stop it before deleting the job record",
         ));
     }
-    {
+    let removed = {
         let mut jobs = state.inner.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        jobs.remove(&id);
+        jobs.remove(&id)
+    };
+    if let Some(handle) = removed {
+        // Dropping a job tears down background resources (worker threads, mmaps,
+        // caches). Never do that on an async worker: a destructor that blocks
+        // panics the whole process ("Cannot drop a runtime in a context where
+        // blocking is not allowed").
+        let _ = tokio::task::spawn_blocking(move || drop(handle)).await;
     }
     remove_persisted(&state.inner.state_dir, &id)
         .map_err(|e| ApiError::internal(format!("remove state: {e}")))?;

@@ -78,15 +78,34 @@ enum Backend {
 pub struct MimirSource {
     cfg: MimirConfig,
     backend: Backend,
-    runtime: Option<tokio::runtime::Runtime>,
     cache_root: PathBuf,
+}
+
+/// Process-wide runtime for the S3 backend.
+///
+/// It must **not** live inside [`MimirSource`]: `MimirSource` values are dropped
+/// from asynchronous contexts (for example an axum handler deleting a job), and
+/// dropping a `tokio::runtime::Runtime` there panics with
+/// "Cannot drop a runtime in a context where blocking is not allowed". A leaked
+/// static runtime is also what keeps the HTTP connection pool warm across
+/// blocks.
+fn s3_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("tsdb-mimir-s3")
+            .build()
+            .expect("build the mimir S3 runtime")
+    })
 }
 
 impl MimirSource {
     pub fn new(mimir: &MimirConfig, output_dir: &Path) -> Result<Self> {
         mimir.validate()?;
         let cache_root = mimir.cache_root(output_dir);
-        let (backend, runtime) = match mimir.backend {
+        let backend = match mimir.backend {
             MimirBackend::Local => {
                 let root = PathBuf::from(&mimir.bucket);
                 if !root.is_dir() {
@@ -95,7 +114,7 @@ impl MimirSource {
                         root.display()
                     )));
                 }
-                (Backend::Local(root), None)
+                Backend::Local(root)
             }
             MimirBackend::S3 => {
                 // object_store's defaults are hostile to multi-GB objects:
@@ -141,18 +160,16 @@ impl MimirSource {
                 let s3 = builder
                     .build()
                     .map_err(|e| Error::Other(format!("mimir: build S3 client: {e}")))?;
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()
-                    .map_err(|e| Error::Other(format!("mimir: create runtime: {e}")))?;
-                (Backend::S3(s3), Some(rt))
+                Backend::S3(s3)
             }
         };
+        // The runtime is created on first S3 use and never dropped.
+        if matches!(backend, Backend::S3(_)) {
+            let _ = s3_runtime();
+        }
         Ok(Self {
             cfg: mimir.clone(),
             backend,
-            runtime,
             cache_root,
         })
     }
@@ -181,7 +198,7 @@ impl MimirSource {
     pub fn list_tenants(&self) -> Result<Vec<String>> {
         let mut tenants = match &self.backend {
             Backend::S3(store) => {
-                let rt = self.runtime.as_ref().expect("s3 runtime");
+                let rt = s3_runtime();
                 let store = store.clone();
                 let root = self.prefix();
                 rt.block_on(async move {
@@ -249,7 +266,7 @@ impl MimirSource {
     fn list_objects(&self, prefix: &str) -> Result<Vec<ObjectEntry>> {
         match &self.backend {
             Backend::S3(store) => {
-                let rt = self.runtime.as_ref().expect("s3 runtime");
+                let rt = s3_runtime();
                 let store = store.clone();
                 let prefix = prefix.trim_end_matches('/').to_string();
                 rt.block_on(async move {
@@ -281,7 +298,7 @@ impl MimirSource {
         let prefix = self.tenant_prefix(tenant);
         let blocks = match &self.backend {
             Backend::S3(store) => {
-                let rt = self.runtime.as_ref().expect("s3 runtime");
+                let rt = s3_runtime();
                 let store = store.clone();
                 let prefix2 = prefix.clone();
                 rt.block_on(async move {
@@ -319,7 +336,7 @@ impl MimirSource {
     ) -> Result<Vec<(String, Option<BlockMeta>, Option<String>)>> {
         match &self.backend {
             Backend::S3(store) => {
-                let rt = self.runtime.as_ref().expect("s3 runtime");
+                let rt = s3_runtime();
                 let store = store.clone();
                 let tenant = tenant.to_string();
                 let prefix = self.tenant_prefix(tenant.as_str());
@@ -563,7 +580,7 @@ impl MimirSource {
                 out
             }
             Backend::S3(store) => {
-                let rt = self.runtime.as_ref().expect("s3 runtime");
+                let rt = s3_runtime();
                 let store = store.clone();
                 let concurrency = self.cfg.max_concurrent_downloads.clamp(1, 64);
                 let dir2 = dir.clone();
@@ -1077,6 +1094,29 @@ mod tests {
         (bucket, ulid, source, out)
     }
 
+    /// Regression: the S3 backend used to own its own tokio runtime, so dropping
+    /// the source from an async context (an axum handler deleting a job) aborted
+    /// the process with "Cannot drop a runtime in a context where blocking is
+    /// not allowed".
+    #[test]
+    fn an_s3_source_can_be_dropped_inside_an_async_context() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = temp_root("drop-async");
+        rt.block_on(async {
+            let cfg = MimirConfig {
+                backend: MimirBackend::S3,
+                bucket: "bucket".to_string(),
+                ..Default::default()
+            };
+            let source = MimirSource::new(&cfg, &out).unwrap();
+            drop(source);
+        });
+        std::fs::remove_dir_all(&out).unwrap();
+    }
     #[test]
     fn part_file_lives_next_to_its_object() {
         let target = Path::new("/cache/t/blk/index");
