@@ -160,7 +160,7 @@ object_store 对 body 流的内部重试还受 `RetryConfig::retry_timeout`（�
 | 配置 | `migrate-core/src/config.rs` | 新增 `MimirConfig` / `MimirBackend`；`JobConfig.data_dir` 可选、新增 `mimir`；校验 tenant/prefix/cache |
 | 数据源 | `migrate-core/src/mimir.rs` | S3/本地后端、tenant 发现、流式清单、meta 并发读取、按块下载/清理 |
 | 规划 | `migrate-core/src/engine.rs` | 有 `mimir` 时构造 `MimirSource` 并调用 `source.plan()`；本地走原 `planner::plan()` |
-| Block 身份 | `tsdb-reader/src/meta.rs` | `BlockInfo` 增加 `tenant`/`remote`/`key()`；本地源填空 |
+| Block 身份 | [tsdb-reader `src/meta.rs`](https://github.com/zhuyanxi/tsdb-reader/blob/main/src/meta.rs) | `BlockInfo` 增加 `tenant`/`remote`/`key()`；本地源填空 |
 | 统计 | `migrate-core/src/stats.rs` | `BlockStats`/`BlockSnapshot` 增加 key/tenant；`Totals.tenants` |
 | 本地标记 | `migrate-core/src/sink/mod.rs` | Mimir 路径 `blocks/tenant=<t>/block=<ulid>/_complete.json`；本地保持 `blocks/block=<ulid>/_complete.json` |
 | Checkpoint | `migrate-core/src/checkpoint.rs` | `tenant` 字段；路径 `state/blocks/<tenant>/<ulid>.json`；本地路径不变 |
@@ -169,7 +169,7 @@ object_store 对 body 流的内部重试还受 `RetryConfig::retry_timeout`（�
 | API | `tsdb-migrate-server/src/api.rs` | `/api/mimir/tenants`；create 支持 `mimir`/可选 `data_dir`；路径校验 |
 | Web | `web/*` | 数据源切换、tenant 扫描/勾选、tenant 列、配置展示 |
 
-**未改动**：`tsdb-reader` 的 index/chunks/chunkenc/tombstones 解析逻辑完全复用。Mimir block 下载后就是一个标准 Block 目录。
+**未改动**：独立 [tsdb-reader](https://github.com/zhuyanxi/tsdb-reader) crate 的 index/chunks/chunkenc/tombstones 解析逻辑完全复用。Mimir block 下载后就是一个标准 Block 目录。
 
 ---
 

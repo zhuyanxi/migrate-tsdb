@@ -34,7 +34,7 @@ Mimir S3 (tenant) ─┘        │                 │
 
 Prometheus 的 Block 目录不适合直接批量读：index 是自定义二进制、chunk 有 6 种编码、还需要处理 tombstones。常见做法是用 Prometheus 自己的查询接口慢慢拉，或者写脚本逐块解析——前者慢且受限于查询引擎，后者很容易在内存和断点续传上翻车。
 
-本项目把「读格式」和「搬数据」彻底分开：`tsdb-reader` 负责零拷贝解析，`migrate-core` 负责流水线与状态管理，上层同时提供 CLI、HTTP API 和 Web 控制台三种入口。
+本项目把「读格式」和「搬数据」彻底分开：独立的 [tsdb-reader](https://github.com/zhuyanxi/tsdb-reader) crate 负责零拷贝解析，`migrate-core` 通过 crates.io 依赖它并负责流水线与状态管理，上层同时提供 CLI、HTTP API 和 Web 控制台三种入口。
 
 ### 核心功能
 
@@ -227,7 +227,6 @@ scripts/bench.sh            # release 吞吐 / RSS
 
 ```bash
 scripts/dev-fixtures.sh     # 重新生成 fixtures/gen/data
-scripts/sync-fixtures.sh    # 同步一份到 crates/tsdb-reader/tests/data
 ```
 
 ## 性能
@@ -248,14 +247,13 @@ scripts/sync-fixtures.sh    # 同步一份到 crates/tsdb-reader/tests/data
 
 ```
 crates/
-  tsdb-reader/           # 格式层：meta/index/chunks/tombstones/chunkenc（可独立发布）
   migrate-core/          # 规划、流水线、控制、checkpoint、Remote Write、manifest
   tsdb-migrate-cli/      # tsdb-migrate 二进制
   tsdb-migrate-server/   # tsdb-migrate-server 二进制（内嵌 web/）
 web/                     # 单页控制台（无构建、无外链）
 fixtures/gen/            # Go 生成器：真实 Block + 6 种编码 fixture + ground truth
 docs/                    # 架构/路线图/格式/API/运维/验证
-scripts/                 # dev-fixtures / sync-fixtures / e2e / mimir-local-e2e / bench
+scripts/                 # dev-fixtures / e2e / mimir-local-e2e / bench
 prometheus/              # 依赖的 Prometheus 源码快照（只读参考）
 ```
 
@@ -272,10 +270,9 @@ prometheus/              # 依赖的 Prometheus 源码快照（只读参考）
    cargo fmt --all -- --check
    cargo clippy --workspace --all-targets
    cargo test --workspace
-   cargo test -p tsdb-reader --no-default-features    # feature 组合不能坏
    ./scripts/e2e.sh && ./scripts/mimir-local-e2e.sh
    ```
-5. **改到格式层要补对拍**：`tsdb-reader` 的任何解析改动，必须让 `fixtures` 测试仍然逐字节通过；改了 fixture 就同步 `tests/data`。
+5. **改到格式层要补对拍**：`tsdb-reader` 的解析与 fixture 测试在[独立仓库](https://github.com/zhuyanxi/tsdb-reader)维护。
 6. **改到行为要补文档**：`docs/` 下的架构、API、验证文档与 README 一起更新。
 
 代码风格：`rustfmt` 默认配置，拒绝新增 clippy 告警；公开 API 必须有文档注释（`tsdb-reader` 已开启 `#![deny(missing_docs)]`）。
@@ -290,7 +287,7 @@ MIT License
 Copyright (c) 2026 zhuyanxi
 ```
 
-`crates/tsdb-reader/src/chunkenc/` 下的 chunk 解码器是 Prometheus TSDB 编解码器的 Rust 移植，这部分仍适用 Apache License 2.0，归属与文件清单见 [NOTICE](NOTICE)，许可证全文见 [LICENSE-APACHE](LICENSE-APACHE)。
+Prometheus TSDB chunk decoder 的 Rust 移植由独立的 [tsdb-reader](https://github.com/zhuyanxi/tsdb-reader) 项目维护；其 MIT 主许可证、Apache-2.0 第三方声明及文件清单以该仓库的 LICENSE、LICENSE-APACHE 和 NOTICE 为准。
 
 ## 致谢与联系
 

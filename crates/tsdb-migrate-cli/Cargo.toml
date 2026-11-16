@@ -9,7 +9,7 @@ name = "tsdb-migrate"
 path = "src/main.rs"
 
 [dependencies]
-tsdb-reader = { path = "../tsdb-reader" }
+tsdb-reader.workspace = true
 migrate-core = { path = "../migrate-core" }
 clap.workspace = true
 serde_json.workspace = true

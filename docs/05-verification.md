@@ -1,6 +1,6 @@
 # 验证报告
 
-> 历史验证报告，记录旧版本 Parquet/DuckDB sink 的测试结果；对应 verify/duckdb-load 功能已删除，数据仅作为历史记录。
+> 历史验证报告，记录旧版本 Parquet/DuckDB sink 和 monorepo 内 tsdb-reader 的测试结果；reader 现由[独立仓库](https://github.com/zhuyanxi/tsdb-reader)维护，对应旧输出功能已删除。
 
 > 验证环境：macOS Darwin arm64，10 核，16 GiB；Rust 1.99；Go 1.27；DuckDB Python 2.0；Prometheus 源码为仓库内 `prometheus/` 快照。
 >

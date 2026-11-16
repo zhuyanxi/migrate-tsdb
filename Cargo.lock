@@ -2153,6 +2153,8 @@ dependencies = [
 [[package]]
 name = "tsdb-reader"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d679f86eff1d162d2c4c54e0a5f371090414e0077c691c217510343b7d77d5d0"
 dependencies = [
  "crc32c",
  "memmap2",

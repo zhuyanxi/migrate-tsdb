@@ -1,5 +1,7 @@
 # tsdb-reader 公开发布（crates.io）就绪度评估
 
+> 历史评估：`tsdb-reader` 已拆分到独立仓库 <https://github.com/zhuyanxi/tsdb-reader>；本文记录拆分前的就绪度分析，不代表当前仓库布局或实时发布状态。当前发布状态以 crates.io 页面为准。
+
 > 评估对象：`crates/tsdb-reader`（3156 行，其中 src 2234 行 / tests 402 行）
 > 结论：**代码质量足以内部使用，但离「可公开发布」还差一轮工程化收尾。** 有 3 个阻塞项（其中 2 个是实证的功能缺陷），其余为 API 收敛、文档与发布流程工作。
 >

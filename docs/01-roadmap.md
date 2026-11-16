@@ -1,6 +1,6 @@
 # 分阶段实现方案与验收标准
 
-> 历史路线图；Parquet、NDJSON、DuckDB 条目记录旧版本实现，不代表当前支持的输出目标。当前唯一 sink 为 Remote Write v1.0。
+> 历史路线图；`tsdb-reader` 已拆分到 [独立仓库](https://github.com/zhuyanxi/tsdb-reader)，Parquet、NDJSON、DuckDB 条目记录旧版本实现，不代表当前支持的输出目标。当前唯一 sink 为 Remote Write v1.0。
 
 > 原则：每个阶段都必须**可运行、可验证**，后一阶段不依赖未完成的承诺。阶段间允许并行，但验收门槛必须逐条通过。
 >
