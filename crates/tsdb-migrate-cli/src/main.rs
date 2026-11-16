@@ -7,10 +7,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{NaiveDate, TimeZone, Utc};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 use migrate_core::config::{
-    Compression, EngineOptions, FilterConfig, JobConfig, LabelMatcher, MimirBackend, MimirConfig,
-    SinkConfig, SinkKind,
+    EngineOptions, FilterConfig, JobConfig, LabelMatcher, MimirBackend, MimirConfig, SinkConfig,
+    SinkKind,
 };
 use migrate_core::control::{Control, JobState};
 use migrate_core::engine::{Engine, EventSink, LogLevel};
@@ -24,7 +24,7 @@ use tsdb_reader::{discover_blocks, BlockReader, ReaderOptions};
 #[command(
     name = "tsdb-migrate",
     version,
-    about = "Streaming exporter for Prometheus TSDB blocks (Parquet / NDJSON / DuckDB)"
+    about = "Streaming exporter for Prometheus TSDB blocks to Remote Write"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,10 +39,6 @@ enum Command {
     Plan(PlanArgs),
     /// Run a migration.
     Migrate(MigrateArgs),
-    /// Verify Parquet row counts against block completion markers.
-    Verify(VerifyArgs),
-    /// Generate and execute the DuckDB load script.
-    DuckdbLoad(DuckdbLoadArgs),
 }
 
 #[derive(Args, Debug)]
@@ -96,12 +92,6 @@ struct MigrateArgs {
     max_time: Option<String>,
     #[arg(long = "match", help = "exact label matcher, e.g. job=api")]
     matchers: Vec<String>,
-    #[arg(long, value_enum, default_value_t = SinkArg::Parquet)]
-    sink: SinkArg,
-    #[arg(long, value_enum, default_value_t = CompressionArg::Zstd)]
-    compression: CompressionArg,
-    #[arg(long, default_value_t = 65_536)]
-    row_group_size: usize,
     #[arg(long, default_value_t = 2)]
     block_parallel: usize,
     #[arg(long, default_value_t = 4)]
@@ -126,45 +116,8 @@ struct MigrateArgs {
     force: bool,
     #[arg(long)]
     fail_fast: bool,
-    #[arg(long)]
-    duckdb_path: Option<String>,
-    #[arg(long)]
-    no_duckdb_exec: bool,
-    /// DuckDB memory cap for the load step, in MiB.
-    #[arg(long, default_value_t = 24576)]
-    duckdb_memory_limit_mb: u64,
-    /// Budget for the DuckDB load temporary data (.duckdb_stage staging + spill),
-    /// in MiB; 0 disables it.
-    #[arg(long, default_value_t = 204800)]
-    duckdb_stage_limit_mb: u64,
-    /// Optional cap for the whole load including the database being written, in
-    /// MiB; 0 (default) leaves the database unbounded.
-    #[arg(long, default_value_t = 0)]
-    duckdb_disk_limit_mb: u64,
-    /// Threads for the DuckDB load step; 0 keeps DuckDB's default.
-    #[arg(long, default_value_t = 0)]
-    duckdb_threads: usize,
-    /// Directory for DuckDB spill files (default: <out>/.duckdb_stage/.spill).
-    #[arg(long, default_value = "")]
-    duckdb_temp_dir: String,
-    /// Load metric tables in batches of N, deleting each batch's staging files
-    /// right after (0 = one process for everything).
-    #[arg(long, default_value_t = 0)]
-    duckdb_metric_batch: usize,
-    /// Delete the Parquet export once staging is done (frees one copy; the data
-    /// then only lives inside DuckDB).
-    #[arg(long)]
-    duckdb_drop_export: bool,
-    /// Stage and load one block at a time: each block's staging (and export) is
-    /// removed before the next one starts.
-    #[arg(long)]
-    duckdb_chunk_by_block: bool,
-    /// One DuckDB file per time window of this many minutes (e.g. 60 = hourly),
-    /// named <YYYY-MM-DDTHH>-<original name> and built in timestamp order.
-    #[arg(long, default_value_t = 0)]
-    duckdb_window_minutes: u64,
     #[arg(long, help = "Prometheus Remote Write endpoint URL")]
-    remote_write_url: Option<String>,
+    remote_write_url: String,
     #[arg(long, default_value = "X-Scope-OrgID")]
     remote_write_tenant_header: String,
     #[arg(long)]
@@ -172,22 +125,6 @@ struct MigrateArgs {
     /// Print progress every N seconds.
     #[arg(long, default_value_t = 2)]
     progress_interval: u64,
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum SinkArg {
-    Parquet,
-    Ndjson,
-    Duckdb,
-    #[value(name = "remote-write")]
-    RemoteWrite,
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-enum CompressionArg {
-    Zstd,
-    Snappy,
-    None,
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -277,68 +214,18 @@ impl MimirArgs {
         Ok(Some(cfg))
     }
 }
-
-#[derive(Args, Debug)]
-struct VerifyArgs {
-    #[arg(long)]
-    out: PathBuf,
-    #[arg(long)]
-    json: bool,
-}
-
-#[derive(Args, Debug)]
-struct DuckdbLoadArgs {
-    #[arg(long)]
-    out: PathBuf,
-    /// DuckDB memory cap for the load step, in MiB.
-    #[arg(long, default_value_t = 24576)]
-    memory_limit_mb: u64,
-    /// Budget for the load temporary data (.duckdb_stage staging + spill), in MiB;
-    /// 0 disables it.
-    #[arg(long, default_value_t = 204800)]
-    stage_limit_mb: u64,
-    /// Optional cap for the whole load including the database being written, in
-    /// MiB; 0 (default) leaves the database unbounded.
-    #[arg(long, default_value_t = 0)]
-    disk_limit_mb: u64,
-    /// Threads for the DuckDB load step; 0 keeps DuckDB's default.
-    #[arg(long, default_value_t = 0)]
-    threads: usize,
-    /// One DuckDB file per time window of this many minutes (0 = single file).
-    #[arg(long, default_value_t = 0)]
-    window_minutes: u64,
-    /// Load metric tables in batches of N, reclaiming staging per batch.
-    #[arg(long, default_value_t = 0)]
-    metric_batch: usize,
-    /// Stage and load one block at a time.
-    #[arg(long)]
-    chunk_by_block: bool,
-    /// DB file for a Prometheus export, or DB directory for a multi-tenant Mimir export.
-    #[arg(long)]
-    db: Option<PathBuf>,
-    /// Generate SQL only; do not invoke the duckdb CLI.
-    #[arg(long)]
-    no_exec: bool,
-    /// Also print the generated SQL (can be large: one statement per metric).
-    #[arg(long)]
-    print_sql: bool,
-}
-
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Inspect(a) => cmd_inspect(a),
         Command::Plan(a) => cmd_plan(a),
         Command::Migrate(a) => cmd_migrate(a),
-        Command::Verify(a) => cmd_verify(a),
-        Command::DuckdbLoad(a) => cmd_duckdb_load(a),
     };
     if let Err(e) = result {
         eprintln!("错误：{e}");
         std::process::exit(1);
     }
 }
-
 fn cmd_inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(mimir) = args.mimir.to_config()? {
         if args.data_dir.is_some() {
@@ -471,7 +358,6 @@ fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(m) => MimirSource::new(m, &cfg.output_dir)?.plan(&cfg)?,
         None => planner::plan(&cfg)?,
     };
-    let estimate = planner::estimated_output_bytes(&plan);
     if args.json {
         let blocks: Vec<_> = plan
             .blocks
@@ -498,7 +384,6 @@ fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
                 "series_total": plan.series_total(),
                 "chunks_total": plan.chunks_total(),
                 "samples_expected": plan.samples_expected(),
-                "estimated_output_bytes": estimate,
                 "warnings": plan.warnings,
             }))?
         );
@@ -508,10 +393,6 @@ fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("series        : {}", plan.series_total());
     println!("chunks        : {}", plan.chunks_total());
     println!("samples (meta): {}", plan.samples_expected());
-    println!(
-        "output estimate: {:.2} GiB",
-        estimate as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
     println!(
         "\n{:<24} {:<28} {:>12} {:>12} {:>14} {:>10}",
         "TENANT", "BLOCK", "SERIES", "CHUNKS", "SAMPLES", "UNITS"
@@ -543,17 +424,6 @@ fn cmd_plan(args: PlanArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let sink = match args.sink {
-        SinkArg::Parquet => SinkKind::Parquet,
-        SinkArg::Ndjson => SinkKind::Ndjson,
-        SinkArg::Duckdb => SinkKind::Duckdb,
-        SinkArg::RemoteWrite => SinkKind::RemoteWrite,
-    };
-    let compression = match args.compression {
-        CompressionArg::Zstd => Compression::Zstd,
-        CompressionArg::Snappy => Compression::Snappy,
-        CompressionArg::None => Compression::None,
-    };
     let opts = EngineOptions {
         block_parallel: args.block_parallel,
         decode_workers: args.decode_workers,
@@ -569,21 +439,8 @@ fn cmd_migrate(args: MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
         continue_on_error: !args.fail_fast,
     };
     let sink_cfg = SinkConfig {
-        kind: sink,
-        compression,
-        row_group_size: args.row_group_size,
-        duckdb_path: args.duckdb_path.clone().unwrap_or_default(),
-        duckdb_exec: !args.no_duckdb_exec,
-        duckdb_memory_limit_mb: args.duckdb_memory_limit_mb,
-        duckdb_stage_limit_mb: args.duckdb_stage_limit_mb,
-        duckdb_disk_limit_mb: args.duckdb_disk_limit_mb,
-        duckdb_threads: args.duckdb_threads,
-        duckdb_temp_dir: args.duckdb_temp_dir.clone(),
-        duckdb_metric_batch: args.duckdb_metric_batch,
-        duckdb_drop_export: args.duckdb_drop_export,
-        duckdb_chunk_by_block: args.duckdb_chunk_by_block,
-        duckdb_window_minutes: args.duckdb_window_minutes,
-        remote_write_url: args.remote_write_url.unwrap_or_default(),
+        kind: SinkKind::RemoteWrite,
+        remote_write_url: args.remote_write_url,
         remote_write_tenant_header: args.remote_write_tenant_header,
     };
     let mimir = args.mimir.to_config()?;
@@ -838,162 +695,4 @@ impl EventSink for ConsoleEvents {
             eprintln!("[{ts}] {level:?}  {msg}");
         }
     }
-}
-
-fn cmd_verify(args: VerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use parquet::file::reader::{FileReader, SerializedFileReader};
-    let manifest = migrate_core::manifest::read(&args.out)?;
-    let mut problems: Vec<String> = Vec::new();
-    let mut report = Vec::new();
-    for block in &manifest.blocks {
-        let dir =
-            migrate_core::sink::output_dir_for(&args.out, block.tenant.as_deref(), &block.ulid);
-        let marker_path = dir.join("_complete.json");
-        let marker: Option<serde_json::Value> = std::fs::read(&marker_path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok());
-        let mut tables = serde_json::Map::new();
-        for (name, expected) in [("samples", block.floats), ("histograms", block.histograms)] {
-            let mut total = 0u64;
-            let mut files = 0u64;
-            if let Ok(rd) = std::fs::read_dir(dir.join(name)) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.extension().map(|x| x == "parquet").unwrap_or(false) {
-                        files += 1;
-                        let r = SerializedFileReader::new(std::fs::File::open(&p)?)?;
-                        total += r.metadata().file_metadata().num_rows() as u64;
-                    }
-                }
-            }
-            if files > 0 && total != expected {
-                problems.push(format!(
-                    "{} {}: rows {} != expected {}",
-                    block.ulid, name, total, expected
-                ));
-            }
-            if files == 0 && expected > 0 {
-                problems.push(format!(
-                    "{} {}: no parquet files but expected {} rows",
-                    block.ulid, name, expected
-                ));
-            }
-            tables.insert(name.to_string(), json!({"files": files, "rows": total}));
-        }
-        let mut series_files = 0u64;
-        let mut series_rows = 0u64;
-        if let Ok(rd) = std::fs::read_dir(dir.join("series")) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().map(|x| x == "parquet").unwrap_or(false) {
-                    series_files += 1;
-                    let r = SerializedFileReader::new(std::fs::File::open(&p)?)?;
-                    series_rows += r.metadata().file_metadata().num_rows() as u64;
-                }
-            }
-        }
-        if block.status == migrate_core::stats::BlockStatus::Completed && marker.is_none() {
-            problems.push(format!(
-                "{}: completed but _complete.json missing",
-                block.ulid
-            ));
-        }
-        report.push(json!({
-            "ulid": block.ulid,
-            "tenant": block.tenant,
-            "status": block.status,
-            "series": {"files": series_files, "rows": series_rows},
-            "tables": tables,
-            "marker": marker.is_some(),
-            "error": block.error,
-        }));
-    }
-    let ok = problems.is_empty();
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "ok": ok,
-                "problems": problems,
-                "blocks": report,
-                "totals": manifest.totals,
-            }))?
-        );
-    } else {
-        for b in &report {
-            println!(
-                "{:<20} {} {:<10} series_rows={} samples_rows={} hists_rows={} marker={}",
-                b["tenant"].as_str().unwrap_or("-"),
-                b["ulid"].as_str().unwrap_or(""),
-                b["status"].as_str().unwrap_or("?"),
-                b["series"]["rows"],
-                b["tables"]["samples"]["rows"],
-                b["tables"]["histograms"]["rows"],
-                b["marker"]
-            );
-        }
-        println!(
-            "\nsamples(total)={} histograms={} bytes_written={:.2} MiB",
-            manifest.totals.samples,
-            manifest.totals.histograms,
-            manifest.totals.bytes_written as f64 / (1024.0 * 1024.0)
-        );
-        if ok {
-            println!("verify OK");
-        } else {
-            println!("\nverify FAILED:");
-            for p in &problems {
-                println!("  - {p}");
-            }
-        }
-    }
-    if !ok {
-        std::process::exit(3);
-    }
-    Ok(())
-}
-
-fn cmd_duckdb_load(args: DuckdbLoadArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let configured = args
-        .db
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let sink = migrate_core::config::SinkConfig {
-        duckdb_path: configured,
-        duckdb_memory_limit_mb: args.memory_limit_mb,
-        duckdb_stage_limit_mb: args.stage_limit_mb,
-        duckdb_disk_limit_mb: args.disk_limit_mb,
-        duckdb_threads: args.threads,
-        duckdb_window_minutes: args.window_minutes,
-        duckdb_metric_batch: args.metric_batch,
-        duckdb_chunk_by_block: args.chunk_by_block,
-        ..Default::default()
-    };
-    let plans = migrate_core::duckdb::plan_with_sink(&args.out, &sink)?;
-    for p in &plans {
-        let scope = match &p.tenant {
-            Some(t) => format!("tenant={t}"),
-            None => "prometheus".to_string(),
-        };
-        println!(
-            "[{scope}] metrics={} samples={} est_db={:.1}GiB budget={:.0}GiB sql={} db={}",
-            p.metrics,
-            p.samples,
-            p.estimated_db_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-            p.limits.disk_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            p.sql_path.display(),
-            p.db_path.display()
-        );
-        for w in &p.warnings {
-            println!("  ! {w}");
-        }
-        if args.print_sql {
-            println!("{}", std::fs::read_to_string(&p.sql_path)?);
-        }
-        if !args.no_exec {
-            migrate_core::duckdb::execute(p)?;
-        }
-    }
-    Ok(())
 }

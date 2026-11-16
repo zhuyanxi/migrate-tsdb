@@ -224,29 +224,6 @@ async function selectJob(id) {
   await refreshDetail();
   await refreshBlocks();
   await refreshLogs();
-  await refreshArtifacts();
-}
-
-// DuckDB instances the job produced (one per time window when windowing is on).
-async function refreshArtifacts() {
-  const box = $('artifactList');
-  if (!box || !S.currentId) return;
-  try {
-    const d = await api('/api/jobs/' + encodeURIComponent(S.currentId) + '/artifacts');
-    const files = d.files || [];
-    if (files.length === 0) {
-      box.innerHTML = '<div class="faint">暂无 DuckDB 产物（sink 不是 duckdb，或尚未执行装载）</div>';
-      return;
-    }
-    const rows = files.map((f) => {
-      const when = f.modified_ms ? new Date(f.modified_ms).toLocaleString() : '';
-      return `<div class="artifact-row"><span class="mono">${escapeHtml(f.name)}</span>
-        <span class="faint">${fmtBytes(f.bytes)} · ${escapeHtml(when)}</span></div>`;
-    }).join('');
-    box.innerHTML = `<div class="faint" style="margin-bottom:6px">${files.length} 个文件 · ${fmtBytes(d.total_bytes || 0)} · ${escapeHtml(d.output_dir || '')}</div>` + rows;
-  } catch (e) {
-    box.innerHTML = '<div class="faint">读取产物失败：' + escapeHtml(e.message) + '</div>';
-  }
 }
 
 async function refreshDetail() {
@@ -276,7 +253,7 @@ function renderDetail(d) {
   const t = j.totals || {};
   $('jobName').textContent = j.name || j.job_id;
   $('jobId').textContent = j.job_id;
-  $('jobSink').textContent = (j.sink_kind || 'parquet') + ' · ' + (d.config && d.config.sink ? d.config.sink.compression : '');
+  $('jobSink').textContent = 'Remote Write';
   $('jobElapsed').textContent = '已运行 ' + fmtDuration(j.elapsed_ms / 1000);
 
   const st = $('jobState');
@@ -326,22 +303,8 @@ function renderDetail(d) {
   $('cfgDataDir').textContent = mcfg ? (mcfg.cache_dir || '默认 <out>/.cache') : j.data_dir;
   $('cfgOutDir').textContent = j.output_dir;
   const sinkConfig = d.config.sink;
-  $('cfgSink').textContent = sinkConfig.kind === 'remote_write'
-    ? `${sinkConfig.remote_write_url} · ${sinkConfig.remote_write_tenant_header || '不带 Tenant Header'}`
-    : `${j.sink_kind} / ${sinkConfig.compression}`;
-  $('cfgSink').title = sinkConfig.kind === 'remote_write' ? sinkConfig.remote_write_url : '';
-  if (sinkConfig.kind === 'duckdb') {
-    const parts = [];
-    parts.push(sinkConfig.duckdb_window_minutes
-      ? `每 ${sinkConfig.duckdb_window_minutes} 分钟一个库`
-      : '单库');
-    if (sinkConfig.duckdb_memory_limit_mb) parts.push(`内存 ${sinkConfig.duckdb_memory_limit_mb} MiB`);
-    if (sinkConfig.duckdb_stage_limit_mb) parts.push(`staging ${sinkConfig.duckdb_stage_limit_mb} MiB`);
-    if (sinkConfig.duckdb_metric_batch) parts.push(`批 ${sinkConfig.duckdb_metric_batch}`);
-    if (sinkConfig.duckdb_chunk_by_block) parts.push('按 block');
-    if (sinkConfig.duckdb_drop_export) parts.push('删导出');
-    $('cfgSink').textContent = `${j.sink_kind} / ${sinkConfig.compression} · ${parts.join(' · ')}`;
-  }
+  $('cfgSink').textContent = `${sinkConfig.remote_write_url} · ${sinkConfig.remote_write_tenant_header || '不带 Tenant Header'}`;
+  $('cfgSink').title = sinkConfig.remote_write_url;
   $('cfgParallel').textContent = `块 ${j.options.block_parallel} · 解码 ${j.options.decode_workers}`;
   $('cfgBatch').textContent = `${fmtInt(j.options.batch_samples)} samples · ${fmtInt(j.options.unit_series)} series`;
   $('cfgFilter').textContent = filterText(d.config.filter);
@@ -480,7 +443,7 @@ async function doAction(action) {
 
 async function doDelete() {
   if (!S.currentId) return;
-  if (!confirm('仅删除任务记录（保留已导出的 Parquet 数据），确定继续？')) return;
+  if (!confirm('仅删除本地任务记录，不会撤回已写入接收端的数据。确定继续？')) return;
   try {
     await api('/api/jobs/' + encodeURIComponent(S.currentId), { method: 'DELETE' });
     S.currentId = null;
@@ -597,23 +560,6 @@ function toggleSource() {
   $('mimirSourceFields').classList.toggle('hidden', !m);
 }
 
-function toggleSink() {
-  const kind = $('fSink').value;
-  const remoteWrite = kind === 'remote_write';
-  const duckdb = kind === 'duckdb';
-  const compression = $('fCompression');
-  $('remoteWriteFields').classList.toggle('hidden', !remoteWrite);
-  $('duckdbFields').classList.toggle('hidden', !duckdb);
-  if (remoteWrite && !compression.disabled) {
-    compression.dataset.previousValue = compression.value;
-    compression.value = 'snappy';
-  } else if (!remoteWrite && compression.disabled) {
-    compression.value = compression.dataset.previousValue || 'zstd';
-    delete compression.dataset.previousValue;
-  }
-  compression.disabled = remoteWrite;
-}
-
 async function discoverTenants() {
   const cfg = mimirConfig();
   if (!cfg.bucket) { toast('请输入 bucket 或本地目录', true); return; }
@@ -694,14 +640,13 @@ function parseMatchers(text) {
 
 async function createJob() {
   const m = mimirMode();
-  const sinkKind = $('fSink').value;
   const dataDir = $('fDataDir').value.trim();
   const outDir = $('fOutDir').value.trim();
   if (!m && !dataDir) { toast('请输入数据目录', true); return; }
   if (m && !$('fMimirBucket').value.trim()) { toast('请输入 bucket 或本地目录', true); return; }
   if (!outDir) { toast('请输入输出目录', true); return; }
   const remoteWriteUrl = $('fRemoteWriteUrl').value.trim();
-  if (sinkKind === 'remote_write' && !remoteWriteUrl) {
+  if (!remoteWriteUrl) {
     toast('请输入 Remote Write endpoint URL', true);
     return;
   }
@@ -732,20 +677,7 @@ async function createJob() {
     blocks: m || allSelected || S.selectedBlocks.size === 0 ? [] : Array.from(S.selectedBlocks),
     filter,
     sink: {
-      kind: sinkKind,
-      compression: sinkKind === 'remote_write' ? 'snappy' : $('fCompression').value,
-      row_group_size: 65536,
-      duckdb_path: '',
-      duckdb_exec: true,
-      duckdb_window_minutes: Number($('fDuckdbWindowMinutes').value) || 0,
-      duckdb_memory_limit_mb: Number($('fDuckdbMemoryLimitMb').value) || 24576,
-      duckdb_stage_limit_mb: Number($('fDuckdbStageLimitMb').value) || 0,
-      duckdb_disk_limit_mb: Number($('fDuckdbDiskLimitMb').value) || 0,
-      duckdb_threads: Number($('fDuckdbThreads').value) || 0,
-      duckdb_metric_batch: Number($('fDuckdbMetricBatch').value) || 0,
-      duckdb_temp_dir: $('fDuckdbTempDir').value.trim(),
-      duckdb_chunk_by_block: $('fDuckdbChunkByBlock').checked,
-      duckdb_drop_export: $('fDuckdbDropExport').checked,
+      kind: 'remote_write',
       remote_write_url: remoteWriteUrl,
       remote_write_tenant_header: $('fRemoteWriteTenantHeader').value.trim(),
     },
@@ -808,13 +740,11 @@ function saveToken() {
 /* ---------------- polling ---------------- */
 
 let detailTimer = null;
-let artifactsTimer = null;
 let blocksTimer = null;
 
 function startPolling() {
   clearInterval(detailTimer);
   clearInterval(blocksTimer);
-  clearInterval(artifactsTimer);
   detailTimer = setInterval(async () => {
     if (document.hidden) return;
     await refreshHealth();
@@ -827,9 +757,6 @@ function startPolling() {
   blocksTimer = setInterval(() => {
     if (!document.hidden && S.currentId) refreshBlocks();
   }, 6000);
-  artifactsTimer = setInterval(() => {
-    if (!document.hidden && S.currentId) refreshArtifacts();
-  }, 15000);
 }
 
 /* ---------------- wiring ---------------- */
@@ -840,8 +767,6 @@ function bind() {
     openModal('newModal');
   });
   $('fSource').addEventListener('change', toggleSource);
-  $('fSink').addEventListener('change', toggleSink);
-  toggleSink();
   $('btnScan').addEventListener('click', scanBlocks);
   $('btnDiscoverTenants').addEventListener('click', discoverTenants);
   $('btnCreate').addEventListener('click', createJob);

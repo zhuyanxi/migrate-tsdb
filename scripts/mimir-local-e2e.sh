@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Mimir layout end-to-end test using a local directory as the S3 bucket.
-# Creates two tenants with the SAME block ULID and verifies tenant isolation.
+# Mimir source smoke test using a local directory as the S3 bucket.
+# Remote Write delivery is covered by scripts/e2e.sh.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -20,30 +20,15 @@ done
 echo "== tenants =="
 "$BIN" inspect --mimir-local-root "$WORK/bucket"
 
-echo "== migrate =="
-"$BIN" migrate --mimir-local-root "$WORK/bucket" --out "$WORK/out" \
-  --block-parallel 2 --decode-workers 2 --unit-series 10 --progress-interval 60
-
-echo "== verify =="
-"$BIN" verify --out "$WORK/out"
-
-echo "== output layout =="
-find "$WORK/out/blocks" -maxdepth 2 -type d | sed "s#$WORK/out/##" | sort
-
-if python3 -c "import duckdb" >/dev/null 2>&1; then
-  echo "== duckdb per-tenant metric tables =="
-  python3 - "$WORK/out" <<'PY'
-import duckdb, glob, sys
-root=sys.argv[1]
-for path in sorted(glob.glob(root + "/load_duckdb_*.sql")):
-    tenant=path.rsplit("load_duckdb_",1)[1][:-4]
-    sql=open(path).read()
-    clean="\n".join(l for l in sql.splitlines() if not l.strip().startswith("--"))
-    c=duckdb.connect()
-    for st in [x.strip() for x in clean.split(";") if x.strip()]:
-        c.execute(st)
-    print(tenant, "metric tables:", len(c.execute("show tables").fetchall()),
-          "fixture_metric_00:", c.execute('SELECT count(*) FROM "fixture_metric_00"').fetchone()[0])
+echo "== plan tenant isolation =="
+"$BIN" plan --mimir-local-root "$WORK/bucket" --out "$WORK/state" --json > "$WORK/plan.json"
+python3 - "$WORK/plan.json" <<'PY'
+import json, sys
+plan = json.load(open(sys.argv[1]))
+blocks = plan["blocks"]
+assert len(blocks) == 2, blocks
+assert {block["tenant"] for block in blocks} == {"tenant-a", "tenant-b"}, blocks
+print("planned blocks:", [(block["tenant"], block["ulid"]) for block in blocks])
 PY
-fi
-echo "OK: $WORK"
+
+echo "OK: Mimir tenant layout"

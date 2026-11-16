@@ -14,4 +14,3 @@ migrate-core = { path = "../migrate-core" }
 clap.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
-parquet.workspace = true

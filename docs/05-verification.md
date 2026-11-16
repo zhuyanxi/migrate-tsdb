@@ -1,5 +1,7 @@
 # 验证报告
 
+> 历史验证报告，记录旧版本 Parquet/DuckDB sink 的测试结果；对应 verify/duckdb-load 功能已删除，数据仅作为历史记录。
+
 > 验证环境：macOS Darwin arm64，10 核，16 GiB；Rust 1.99；Go 1.27；DuckDB Python 2.0；Prometheus 源码为仓库内 `prometheus/` 快照。
 >
 > 所有数据均由仓库内 `fixtures/gen`（直接调用 Prometheus 官方 Go 实现）生成，不是手工构造的假数据。

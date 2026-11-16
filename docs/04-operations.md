@@ -13,7 +13,7 @@ cargo build --release
 | `target/release/tsdb-migrate` | 本地/一次性迁移 CLI |
 | `target/release/tsdb-migrate-server` | HTTP API + 内嵌 Web 控制台（单二进制） |
 
-依赖：Rust 1.85+；无 C/C++ 运行时依赖（DuckDB 为可选外部 CLI）。
+依赖：Rust 1.85+；无 C/C++ 运行时依赖。
 
 交叉编译示例：
 
@@ -35,26 +35,23 @@ tsdb-migrate inspect --data-dir /prometheus/data
 # 只做计划，不写数据
 tsdb-migrate plan --data-dir /prometheus/data --out /mnt/export
 
-# 迁移（默认 Parquet/zstd）
-tsdb-migrate migrate --data-dir /prometheus/data --out /mnt/export \
-  --block-parallel 2 --decode-workers 4 --unit-series 50000
+# 推送到 Remote Write
+tsdb-migrate migrate --data-dir /prometheus/data --out /var/lib/tsdb-migrate/job \
+  --remote-write-url https://receiver.example/api/v1/write \
+  --block-parallel 1 --decode-workers 4 --unit-series 50000
 
 # 只迁某几个块 / 时间范围 / 标签
 tsdb-migrate migrate ... --blocks 01H...,01H...
 tsdb-migrate migrate ... --min-time 2026-01-01 --max-time 2026-02-01
 tsdb-migrate migrate ... --match job=api --match env=prod
 
-# 中断后续跑（默认 resume=true，重复执行即可）
-tsdb-migrate migrate --data-dir /prometheus/data --out /mnt/export
+# 中断后恢复（默认 resume=true，重复执行即可）
+tsdb-migrate migrate --data-dir /prometheus/data --out /var/lib/tsdb-migrate/job \
+  --remote-write-url https://receiver.example/api/v1/write
 
 # 强制重迁某个已完成块
 tsdb-migrate migrate ... --force
 
-# 校验行数
-tsdb-migrate verify --out /mnt/export
-
-# 生成并执行 DuckDB 装载
-tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/metrics.duckdb
 ```
 
 ### 2.2 退出码
@@ -64,7 +61,6 @@ tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/metrics.duckdb
 | 0 | 成功（Completed） |
 | 1 | 参数/格式/IO 错误，任务未启动 |
 | 2 | 任务结束但状态为 Failed 或 Stopped |
-| 3 | `verify` 发现不一致 |
 
 ### 2.3 机器可读进度
 
@@ -72,7 +68,7 @@ tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/metrics.duckdb
 
 ```json
 {"state":"running","elapsed_ms":12000,"series_done":1500,"series_total":50000,"chunks_done":18000,"chunks_total":600000,"samples":2150000,"samples_skipped_tombstone":41,"samples_skipped_range":0,"bytes_read":1200000,"blocks_completed":0,"blocks_total":10,"samples_per_sec":182000.0,"eta_seconds":42}
-{"event":"finished","state":"completed","failed_blocks":0,"skipped_blocks":0,"samples":28815462,"floats":28815342,"histograms":120,"samples_skipped_tombstone":41,"samples_skipped_range":0,"bytes_read":40000000,"bytes_written":91000000}
+{"event":"finished","state":"completed","failed_blocks":0,"skipped_blocks":0,"samples":28815462,"floats":28815342,"histograms":120,"samples_skipped_tombstone":41,"samples_skipped_range":0,"bytes_read":40000000,"bytes_written":0}
 ```
 
 日志始终写 stderr，不污染 stdout。
@@ -89,7 +85,7 @@ tsdb-migrate-server \
   --bind 0.0.0.0:8080 \
   --state-dir /var/lib/tsdb-migrate \
   --allow-root /prometheus \
-  --allow-root /mnt/duckdb
+  --allow-root /var/lib/tsdb-migrate/jobs
 ```
 
 - `--allow-root` 可重复，默认当前工作目录；API 中所有路径必须落在其下。
@@ -112,7 +108,7 @@ ExecStart=/usr/local/bin/tsdb-migrate-server \
   --bind 0.0.0.0:8080 \
   --state-dir /var/lib/tsdb-migrate \
   --allow-root /prometheus \
-  --allow-root /mnt/duckdb
+  --allow-root /var/lib/tsdb-migrate/jobs
 Restart=on-failure
 RestartSec=3
 # 迁移是 IO/CPU 密集型，避免被 OOM killer 误杀
@@ -130,7 +126,7 @@ COPY target/release/tsdb-migrate-server /usr/local/bin/
 RUN useradd -r -u 1000 migrate && mkdir -p /state && chown migrate /state
 USER migrate
 ENTRYPOINT ["/usr/local/bin/tsdb-migrate-server"]
-CMD ["--bind","0.0.0.0:8080","--state-dir","/state","--allow-root","/prometheus","--allow-root","/export"]
+CMD ["--bind","0.0.0.0:8080","--state-dir","/state","--allow-root","/prometheus","--allow-root","/jobs"]
 ```
 
 ```bash
@@ -138,13 +134,13 @@ docker run -d --name tsdb-migrate \
   -p 8080:8080 \
   -e TSDB_MIGRATE_TOKEN=change-me \
   -v /prometheus:/prometheus:ro \
-  -v /mnt/duckdb:/export \
+  -v /var/lib/tsdb-migrate/jobs:/jobs \
   -v tsdb-migrate-state:/state \
   --memory 8g \
   tsdb-migrate-server
 ```
 
-建议把 Prometheus 数据目录**只读**挂载；输出目录单独挂载。
+建议把 Prometheus 数据目录**只读**挂载；本地任务状态目录单独持久化挂载，样本由 Remote Write 发送到接收端。
 
 ### 3.4 反向代理
 
@@ -169,13 +165,12 @@ location / {
 
 | 参数 | 默认 | 作用 | 调大 | 调小 |
 |------|------|------|------|------|
-| `block_parallel` | 2 | 同时处理的 Block 数 | 吞吐↑，内存/文件句柄↑ | 内存↓ |
+| `block_parallel` | 2（实际固定为 1） | 同时处理的 Block 数 | Remote Write 为保证顺序固定为 1 | 内存↓ |
 | `decode_workers` | 4 | 每个 Block 的解码线程 | 单块吞吐↑（受核数限制） | CPU/内存↓ |
-| `batch_samples` | 65536 | 每批样本数 | 写放大↓，内存↑ | 内存↓，小文件↑ |
+| `batch_samples` | 65536 | 每个 HTTP 请求的样本上限 | 请求数↓，内存↑ | 内存↓，请求数↑ |
 | `batch_bytes` | 32MiB | 每批字节上限 | 同上 | 同上 |
-| `unit_series` | 50000 | checkpoint 粒度 | 小文件↓，暂停延迟↑ | 暂停更快，文件更多 |
+| `unit_series` | 50000 | checkpoint / 重放粒度 | checkpoint 次数↓，恢复时可能重放更多样本 | checkpoint 次数↑ |
 | `channel_capacity` | 2048 | series 通道容量 | 流水线更顺，内存↑ | 内存↓ |
-| `row_group_size` | 65536 | Parquet 行组 | 压缩率↑，内存↑ | 内存↓ |
 
 总解码线程 = `block_parallel × decode_workers`，建议 ≤ 物理核数 − 2。
 
@@ -199,128 +194,59 @@ RSS ≈ 基础 80MiB
 
 建议容器内存 ≥ `1GiB + block_parallel × decode_workers × 64MiB`，并给 page cache 留余量。
 
-### 4.3 磁盘
+### 4.3 网络与本地磁盘
 
-- 输出约等于压缩 chunk 大小的 0.9–1.3 倍（zstd），再加少量元数据。
-- 启动时会打印估算值；建议预留 1.5 倍。
-- 每个 unit × worker 会生成最多 3 个 part 文件；`unit_series` 越小文件越多。
+- 样本数据直接发送到 Remote Write 接收端，不落本地文件；本地目录仅保存 manifest、checkpoint、完成标记和可选的 Mimir 下载缓存。
+- `batch_samples` / `batch_bytes` 控制请求大小；批次越大，通常请求数越少但单次内存占用越高。
+- Mimir 下载缓存可显著增加本地磁盘占用；配置 `mimir_keep_cache` 时会在迁移后保留。
 
 ---
 
-## 5. 输出与 DuckDB
+## 5. Remote Write 与本地状态
 
-### 5.1 目录
+### 5.1 本地目录
 
 ```
 <out>/
-├── manifest.json
-├── .cache/                            # Mimir 下载缓存
-├── .duckdb_stage/                     # DuckDB metric 分区中间产物
-├── load_duckdb.sql                    # Prometheus
-├── load_duckdb_<tenant>.sql           # Mimir，每 tenant 一份
+├── manifest.json                      # 任务级汇总
+├── .cache/                            # 可选的 Mimir 下载缓存
 ├── .state/blocks/<ULID>.json          # 本地源 checkpoint
 ├── .state/blocks/<tenant>/<ULID>.json # Mimir 源 checkpoint
-├── migration.duckdb                   # Prometheus 单实例
-├── duckdb/<tenant>.duckdb             # Mimir 每 tenant 实例
 └── blocks/
-    ├── block=<ULID>/                  # 本地目录源
-    │   ├── _complete.json
-    │   └── {series,samples,histograms}/part-*.parquet
-    └── tenant=<tenant>/block=<ULID>/  # Mimir 源
-        ├── _complete.json
-        └── {series,samples,histograms}/part-*.parquet
+    ├── block=<ULID>/_complete.json
+    └── tenant=<tenant>/block=<ULID>/_complete.json
 ```
 
-### 5.2 装载
+样本数据不保存在 `<out>`；删除本地任务目录不会撤回已写入接收端的数据。
+
+### 5.2 交付与恢复
 
 ```bash
-# Prometheus：单 DB
-tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/metrics.duckdb
-
-# Mimir：按 tenant 生成多个 DB（--db 为目录）
-tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/
-
-# 只生成 SQL，不执行
-tsdb-migrate duckdb-load --out /mnt/export --no-exec
-
-# 直接使用 DuckDB CLI 执行（单 tenant 示例）
-duckdb /mnt/duckdb/tenant-a.duckdb < /mnt/export/load_duckdb_tenant-a.sql
+export TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN=replace-me
+tsdb-migrate migrate --data-dir /prometheus/data \
+  --out /var/lib/tsdb-migrate/job \
+  --remote-write-url https://receiver.example/api/v1/write \
+  --remote-write-tenant-header X-Scope-OrgID
 ```
 
-- Prometheus 源：`<out>/migration.duckdb`（默认）或 `sink.duckdb_path` 指定 `.duckdb` 文件。
-- Mimir 源：`<out>/duckdb/<tenant>.duckdb`（默认）或 `sink.duckdb_path` 指定目录。
-- 每个 DB 装载前重建，避免旧 metric 表残留。
-
-### 5.3 表结构
-
-每个 metric 一张表，表名即 metric name；label 列 + `timestamp` + 数据值：
-
-```sql
--- float metric
-CREATE TABLE "http_requests_total" (
-  "timestamp" TIMESTAMP,
-  "value"     DOUBLE,
-  "job"       VARCHAR,
-  "instance"  VARCHAR,
-  "method"    VARCHAR
-);
-
--- native histogram metric
-CREATE TABLE "http_request_duration_seconds" (
-  "timestamp" TIMESTAMP,
-  "count" DOUBLE,
-  "sum" DOUBLE,
-  "zero_count" DOUBLE,
-  "schema" INTEGER,
-  "zero_threshold" DOUBLE,
-  "pos_spans" LIST<STRUCT("offset" INTEGER, "length" UINTEGER)>,
-  "neg_spans" LIST<STRUCT("offset" INTEGER, "length" UINTEGER)>,
-  "pos_buckets" LIST<DOUBLE>,
-  "neg_buckets" LIST<DOUBLE>,
-  "custom_values" LIST<DOUBLE>,
-  "reset_hint" UTINYINT,
-  "st" BIGINT,
-  "job" VARCHAR
-);
-```
-
-规则与限制见 `docs/07-duckdb-schema.md`：`__name__` 不建列、缺失 label 为 NULL、保留列冲突时 label 重命名为 `label_<name>`。
-
-### 5.4 常用查询
-
-```sql
--- 某 metric 全部点
-SELECT * FROM "http_requests_total"
-WHERE "timestamp" >= TIMESTAMP '2026-11-01 00:00:00';
-
--- 某 label 组合
-SELECT "timestamp", "value" FROM "http_requests_total"
-WHERE "job" = 'api' AND "instance" = 'host-1'
-ORDER BY 1;
-
--- 直方图桶展开
-SELECT "timestamp", unnest("pos_buckets") AS bucket_count
-FROM "http_request_duration_seconds" LIMIT 10;
-
--- Mimir：对每个 tenant 的 DB 分别执行；表名相同，互不干扰
-```
+- Mimir tenant 默认通过 `X-Scope-OrgID` 转发；多 tenant 任务必须保留 tenant header。
+- Remote Write v1.0 不支持 native histogram，遇到时 block 会失败，可能已有其他 worker 的 float 请求送达。
+- 接收端请求与本地 checkpoint 非事务；进程在请求成功后、checkpoint 写入前退出时，恢复会重放当前单元。
 
 ## 6. 故障恢复
 
 ### 6.1 暂停 / 停止 / 崩溃
 
-- 暂停/停止在**单元边界**生效：当前单元的所有 part 完成 fsync 后才写 checkpoint。
-- checkpoint 记录 `completed_unit` 与 `next_offset`；恢复时：
-  1. 删除 unit 编号 > `completed_unit` 的 part（未提交尾部）；
-  2. 从 `next_offset` 继续遍历 index。
-- 因此 part 粒度**不重不漏**；当前未提交单元会重做。
+- 暂停/停止在**单元边界**生效：当前单元的所有 worker 请求返回后才写 checkpoint。
+- checkpoint 记录 `completed_unit` 与 `next_offset`；恢复时从 `next_offset` 继续遍历 index。
+- 接收端写入与 checkpoint 非事务：如果请求已成功、checkpoint 尚未落盘时进程退出，恢复会重发当前单元；接收端通常按相同 series/时间戳幂等处理，但不保证 exactly-once。
 - 进程被 `kill -9`、机器断电、容器重启都适用；服务端重启会把 running 任务恢复为 `paused(interrupted)`。
 
 ### 6.2 已完成块
 
 - `blocks/[tenant=<tenant>/]block=<ULID>/_complete.json` 是完成标记；默认跳过。
-- `--force` / API 新建任务并指定同一输出目录（需先删除旧任务记录）可重迁。
-- 删除任务记录不会删除输出数据。
+- `--force` / API 新建任务并指定同一输出目录（需先删除旧任务记录）会重新发送该块。
+- 本地目录不保存样本数据；删除任务记录不会撤回已写入接收端的数据。
 
 ### 6.3 CRC / 解码错误
 
@@ -338,10 +264,8 @@ FROM "http_request_duration_seconds" LIMIT 10;
 | `unknown index file version 4` | 未来格式 | 升级工具；先不要迁移 |
 | `chunk encoding 7` | 新编码 | 升级工具；`unknown_encodings` 计数 |
 | `checksum mismatch: chunk` | 磁盘损坏/拷贝不完整 | 校验源盘；备份后重试 |
-| `duckdb CLI not found` | 未安装 DuckDB | 手动执行 `load_duckdb.sql` |
 | `outside the allowed roots` | 路径不在 `--allow-root` | 增加 allow-root 或改路径 |
 | 暂停很久不生效 | 当前 unit 很大 | 调小 `--unit-series` |
-| 小文件过多 | unit 太小 | 调大 `--unit-series` |
 | 任务恢复后进度从 0 开始 | 引擎未 hydrate 或 checkpoint 缺失 | 查看 `.state/blocks/<ULID>.json` |
 
 ---
@@ -355,7 +279,7 @@ s3://<bucket>/<storage-prefix>/<tenant>/<ULID>/{meta.json,index,tombstones,chunk
 ```
 
 - tenant 是 bucket/prefix 下的第一级目录；同一 ULID 可以出现在多个 tenant。
-- 迁移输出为 `blocks/tenant=<tenant>/block=<ULID>/...`，DuckDB 自动多出 `tenant` Hive 列。
+- 本地完成标记位于 `blocks/tenant=<tenant>/block=<ULID>/_complete.json`；样本数据通过 Remote Write 发送。
 - checkpoint 为 `.state/blocks/<tenant>/<ULID>.json`，不同 tenant 互不覆盖。
 - `bucket-index.json`、`markers/`、`debug/` 等控制面对象会被忽略；`deletion-mark.json` 标记的块跳过。
 
@@ -366,16 +290,30 @@ s3://<bucket>/<storage-prefix>/<tenant>/<ULID>/{meta.json,index,tombstones,chunk
 tsdb-migrate inspect --mimir-bucket bucketA --mimir-prefix mimir --mimir-region us-east-1
 
 # 迁指定 tenant（可重复 / 逗号分隔）
-tsdb-migrate migrate   --mimir-bucket bucketA --mimir-prefix mimir --mimir-region us-east-1   --mimir-tenant tenant-a --mimir-tenant tenant-b   --out /mnt/export --block-parallel 2 --decode-workers 4
+tsdb-migrate migrate \
+  --mimir-bucket bucketA --mimir-prefix mimir --mimir-region us-east-1 \
+  --mimir-tenant tenant-a --mimir-tenant tenant-b \
+  --out /var/lib/tsdb-migrate/mimir-job \
+  --remote-write-url https://receiver.example/api/v1/write \
+  --remote-write-tenant-header X-Scope-OrgID --block-parallel 1 --decode-workers 4
 
 # 迁全部 tenant（省略 --mimir-tenant）
-tsdb-migrate migrate --mimir-bucket bucketA --mimir-prefix mimir --out /mnt/export
+tsdb-migrate migrate \
+  --mimir-bucket bucketA --mimir-prefix mimir \
+  --out /var/lib/tsdb-migrate/mimir-job \
+  --remote-write-url https://receiver.example/api/v1/write --block-parallel 1
 
 # MinIO / S3 兼容
-tsdb-migrate migrate   --mimir-bucket mimir-blocks   --mimir-endpoint http://127.0.0.1:9000   --mimir-allow-http --mimir-path-style   --out /mnt/export
+tsdb-migrate migrate \
+  --mimir-bucket mimir-blocks --mimir-endpoint http://127.0.0.1:9000 \
+  --mimir-allow-http --mimir-path-style \
+  --out /var/lib/tsdb-migrate/mimir-job \
+  --remote-write-url https://receiver.example/api/v1/write
 
 # 本地目录模拟 bucket（离线测试 / NFS 镜像）
-tsdb-migrate migrate --mimir-local-root /mnt/mimir-mirror --out /mnt/export
+tsdb-migrate migrate --mimir-local-root /mnt/mimir-mirror \
+  --out /var/lib/tsdb-migrate/mimir-job \
+  --remote-write-url https://receiver.example/api/v1/write
 ```
 
 凭证：
@@ -422,9 +360,6 @@ export AWS_REGION=us-east-1
   的停滞检测。若必须限制单请求时长（例如限制总带宽的代理），注意它覆盖整个响应体，
   大对象会被腰斩成 `request or response body error`。
 - 连续零进展 `--mimir-download-retries`（默认 20）次后才放弃该对象。
-- DuckDB 装载阶段默认限 **24 GiB 内存 / 200 GiB 磁盘**（`--duckdb-memory-limit-mb`、`--duckdb-disk-limit-mb`）：
-  内存由 DuckDB 的 `memory_limit` 硬保证（超出则溢写），磁盘预算由装载器每 500 ms 校验，超限即中止且不发布数据库。
-  溢写目录默认 `<out>/.duckdb_stage/.spill`，可用 `--duckdb-temp-dir` 指到大盘。
 
 ### 7.4 API / Web
 
@@ -432,18 +367,11 @@ export AWS_REGION=us-east-1
 - Web 新建任务选择「Grafana Mimir 对象存储（S3）」→ 填 bucket/prefix/region/endpoint → 扫描 tenant → 勾选 → 创建。
 - 任务详情按块展示 tenant；配置面板显示 bucket/prefix 与实际 tenant 过滤。
 
-### 7.5 DuckDB
+### 7.5 Remote Write tenant 路由
 
-每个 tenant 一个独立 DB：
-
-```bash
-duckdb /mnt/export/duckdb/tenant-a.duckdb
-```
-
-```sql
--- 该 DB 只包含 tenant-a 的 metric 表
-SELECT count(*) FROM "http_requests_total";
-```
+- Mimir tenant 默认通过 `X-Scope-OrgID` 转发；可用 `--remote-write-tenant-header` 修改 header 名称。
+- 多 tenant 任务留空 tenant header 会被拒绝，避免将不同 tenant 的数据合并。
+- 验证迁移结果应在 Remote Write 接收端按 tenant 检查样本与时间范围。
 
 ### 7.6 一致性
 
@@ -464,7 +392,7 @@ SELECT count(*) FROM "http_requests_total";
 | `state == failed` | 立即 |
 | `totals.crc_errors + decode_errors > 0` | 立即 |
 | `rate.samples_per_sec == 0` 且状态 running 超过 5 分钟 | 检查是否卡住 |
-| 输出目录可用空间 < 10% | 扩容/清理 |
+| Mimir 缓存目录可用空间 < 10% | 扩容/清理缓存 |
 
 ---
 
@@ -474,4 +402,4 @@ SELECT count(*) FROM "http_requests_total";
 2. 建议先完成 compaction，减少重叠块与碎片。
 3. 迁移期间 Prometheus 可以继续运行；本工具只读打开文件（mmap），不会修改块。
 4. 如果 Prometheus 正在删除/压缩块，可能出现文件消失或部分读取失败；建议对数据目录做快照，或在低峰期迁移。
-5. 保留原始块直到 `verify` 与业务校验通过。
+5. 保留原始块直到 Remote Write 接收端的数据校验通过。

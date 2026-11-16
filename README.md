@@ -4,11 +4,11 @@
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/zhuyanxi/migrate-tsdb/pulls)
 
-把 Prometheus TSDB Block 与 Grafana Mimir 对象存储里的海量历史样本，以**有界内存、可暂停恢复、part 粒度不重不漏**的方式迁移到 Parquet / DuckDB / Remote Write。纯 Rust 实现，不需要 Go runtime，也不构建 Prometheus 查询引擎。
+把 Prometheus TSDB Block 与 Grafana Mimir 对象存储里的海量历史样本，以**有界内存、可暂停恢复**的方式迁移到 Prometheus Remote Write v1.0 接收端。纯 Rust 实现，不需要 Go runtime，也不构建 Prometheus 查询引擎。
 
 ```
 Prometheus Blocks ─┐
-                   ├─▶ tsdb-reader ──▶ migrate-core ──▶ Parquet (Hive 分区) ──▶ DuckDB
+                   ├─▶ tsdb-reader ──▶ migrate-core ──▶ Prometheus Remote Write v1.0
 Mimir S3 (tenant) ─┘        │                 │
   tenant 发现          index/chunks/     pipeline / checkpoint / sink
   按块下载 cache        tombstones
@@ -43,10 +43,10 @@ Prometheus 的 Block 目录不适合直接批量读：index 是自定义二进�
 | 零拷贝读取 | mmap index 与 chunk segment；只建立 `symbols/32` 偏移表，不把全部 label 字符串读进内存 |
 | 全编码支持 | XOR、XOR2、Histogram、FloatHistogram、HistogramST、FloatHistogramST |
 | Tombstones 感知 | 按 series ref + 闭区间过滤，不导出已删除样本 |
-| 两种数据源 | 本地 Prometheus 目录；Grafana Mimir 对象存储（AWS S3 / MinIO / 本地目录模拟），自动识别 tenant 并隔离输出 |
+| 两种数据源 | 本地 Prometheus 目录；Grafana Mimir 对象存储（AWS S3 / MinIO / 本地目录模拟），自动识别 tenant 并通过 tenant header 路由 |
 | 有界内存 | Block 级并行 × 块内解码线程，背压 + 批量 + 单元屏障；内存占用与数据总量无关 |
-| 断点续传 | 单元级 checkpoint + 确定性 part 文件名；恢复时清理未提交尾部 |
-| 多种输出 | Parquet（Hive 分区）、NDJSON、DuckDB（每 metric 一张宽表）、Prometheus Remote Write v1.0 |
+| 断点续传 | 单元级 checkpoint；接收端写入与本地 checkpoint 非事务，恢复时可能重发当前单元 |
+| 唯一输出 | Prometheus Remote Write v1.0（Snappy + protobuf），样本数据不落本地文件 |
 | 三种形态 | 本地 CLI、可部署 HTTP API、内嵌 Web 控制台（启动/暂停/恢复/停止 + 实时进度） |
 
 ## 安装与快速开始
@@ -54,7 +54,6 @@ Prometheus 的 Block 目录不适合直接批量读：index 是自定义二进�
 ### 环境要求
 
 - **Rust stable**（开发环境为 1.99；`tsdb-reader` crate 声明的 MSRV 为 1.77）
-- 可选：`duckdb` CLI（`--sink duckdb` 自动装载时需要，缺失时只生成 SQL）
 - 可选：Go 1.26+（仅在重新生成测试 fixture 时需要）
 
 ### 从源码构建
@@ -76,30 +75,26 @@ cargo build --release
 # 1. 看一眼有哪些块
 ./target/release/tsdb-migrate inspect --data-dir /prometheus/data
 
-# 2. 导出为 Parquet（中断后重跑同一条命令即可续传）
+# 2. 推送到 Remote Write（中断后重跑同一条命令即可恢复）
+export TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN=replace-me
 ./target/release/tsdb-migrate migrate \
   --data-dir /prometheus/data \
-  --out /mnt/export \
-  --block-parallel 2 --decode-workers 4
-
-# 3. 校验行数
-./target/release/tsdb-migrate verify --out /mnt/export
+  --out /var/lib/tsdb-migrate/job \
+  --remote-write-url https://receiver.example/api/v1/write \
+  --block-parallel 1 --decode-workers 4
 ```
 
-输出默认落在 `/mnt/export/blocks/block=<ULID>/{series,samples,histograms}/part-*.parquet`，目录结构见[配置说明](#输出目录)。
+`--out` 是本地任务状态目录，只存 checkpoint、manifest 和 block 完成标记，不存样本数据。
 
 ## 使用示例
 
-### 1. 导出为 Parquet 并查询
+### 1. 推送到 Remote Write 接收端
 
 ```bash
-./target/release/tsdb-migrate migrate --data-dir /prometheus/data --out /mnt/export
-```
-
-```sql
--- DuckDB 直接读分区目录
-SELECT count(*) FROM read_parquet('/mnt/export/blocks/**/samples/*.parquet',
-                                  hive_partitioning = true);
+export TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN=replace-me
+./target/release/tsdb-migrate migrate \
+  --data-dir /prometheus/data --out /var/lib/tsdb-migrate/job \
+  --remote-write-url https://receiver.example/api/v1/write
 ```
 
 ### 2. 迁移 Grafana Mimir 对象存储
@@ -115,7 +110,8 @@ export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1
 # 迁指定 tenant（省略 --mimir-tenant 表示全部）
 ./target/release/tsdb-migrate migrate \
   --mimir-bucket bucketA --mimir-prefix mimir --mimir-tenant tenant-a \
-  --out /mnt/export
+  --out /var/lib/tsdb-migrate/job \
+  --remote-write-url https://receiver.example/api/v1/write
 ```
 
 MinIO / 本地镜像：
@@ -123,44 +119,17 @@ MinIO / 本地镜像：
 ```bash
 ./target/release/tsdb-migrate migrate --mimir-bucket mimir-blocks \
   --mimir-endpoint http://127.0.0.1:9000 --mimir-allow-http --mimir-path-style \
-  --out /mnt/export
+  --out /var/lib/tsdb-migrate/job \
+  --remote-write-url https://receiver.example/api/v1/write
 
-./target/release/tsdb-migrate migrate --mimir-local-root /mnt/mimir-mirror --out /mnt/export
-```
-
-### 3. 直接产出 DuckDB
-
-每个 metric 一张表，表名即 metric name；每个 label 一列；另有 `timestamp` 列。Prometheus 源生成单个 DB，Mimir 源为每个 tenant 生成一个 DB。
-
-```bash
-# Prometheus：单个 DB
-./target/release/tsdb-migrate duckdb-load --out /mnt/export --db /mnt/metrics.duckdb
-
-# Mimir：每 tenant 一个 DB（--db 传目录）
-./target/release/tsdb-migrate duckdb-load --out /mnt/export --db /mnt/duckdb/
-
-# 只生成 SQL，不执行（服务器没有 duckdb CLI 时）
-./target/release/tsdb-migrate duckdb-load --out /mnt/export --no-exec --print-sql
-```
-
-```sql
-SELECT "timestamp", "value" FROM "http_requests_total"
-WHERE "job" = 'api' ORDER BY 1;
-```
-
-### 4. 推送到 Remote Write 接收端
-
-```bash
-export TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN=replace-me
 ./target/release/tsdb-migrate migrate \
-  --data-dir /prometheus/data --out /mnt/export \
-  --sink remote-write \
+  --mimir-local-root /mnt/mimir-mirror --out /var/lib/tsdb-migrate/job \
   --remote-write-url https://receiver.example/api/v1/write
 ```
 
-Mimir 每 tenant 默认走 `X-Scope-OrgID`，可用 `--remote-write-tenant-header` 改；Remote Write v1.0 不支持 native histogram，遇到会直接失败而不是静默丢数。协议细节见 [docs/08-remote-write-sink.md](docs/08-remote-write-sink.md)。
+本地源不发送 tenant header；Mimir 默认使用 `X-Scope-OrgID`，可用 `--remote-write-tenant-header` 修改。Remote Write v1.0 不支持 native histogram，遇到会直接失败而不是静默丢数。协议细节见 [docs/08-remote-write-sink.md](docs/08-remote-write-sink.md)。
 
-### 5. 启动 HTTP API + Web 控制台
+### 3. 启动 HTTP API + Web 控制台
 
 ```bash
 TSDB_MIGRATE_TOKEN=change-me ./target/release/tsdb-migrate-server \
@@ -181,16 +150,15 @@ TSDB_MIGRATE_TOKEN=change-me ./target/release/tsdb-migrate-server \
 | `tsdb-migrate inspect` | 列出数据目录或 Mimir bucket 中的块与 tenant |
 | `tsdb-migrate plan` | 只做规划，不写数据 |
 | `tsdb-migrate migrate` | 执行迁移 |
-| `tsdb-migrate verify` | 用完成标记核对 Parquet 行数 |
-| `tsdb-migrate duckdb-load` | 生成并执行 DuckDB 装载 SQL |
 
 ### 迁移关键参数
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--data-dir` | — | Prometheus 数据目录（与 Mimir 参数二选一） |
-| `--out` | 必填 | 输出目录 |
-| `--sink` | `parquet` | `parquet` / `ndjson` / `duckdb` / `remote-write` |
+| `--out` | 必填 | 本地任务状态目录，不保存样本数据 |
+| `--remote-write-url` | 必填 | Prometheus Remote Write v1.0 接收端 URL |
+| `--remote-write-tenant-header` | `X-Scope-OrgID` | Mimir tenant header；留空表示不发送 |
 | `--block-parallel` | 2 | 同时处理的块数；Remote Write 会被强制为 1 以保证顺序 |
 | `--decode-workers` | 4 | 单块内解码线程数 |
 | `--batch-samples` | 65536 | 批次样本上限（≥1024） |
@@ -231,20 +199,16 @@ TSDB_MIGRATE_TOKEN=change-me ./target/release/tsdb-migrate-server \
 ```
 <out>/
 ├── manifest.json                      # 任务级汇总
-├── blocks/block=<ULID>/               # 本地源
-│   ├── _complete.json                 # 完成标记（verify 依赖它）
-│   └── {series,samples,histograms}/part-*.parquet
-├── blocks/tenant=<tenant>/block=<ULID>/   # Mimir 源
+├── blocks/block=<ULID>/_complete.json # 本地源完成标记
+├── blocks/tenant=<tenant>/block=<ULID>/_complete.json # Mimir 源完成标记
 ├── .state/blocks/<ULID>.json          # checkpoint
-├── migration.duckdb                   # Prometheus 单实例
-├── duckdb/<tenant>.duckdb             # Mimir 每 tenant 实例
-└── load_duckdb[_<tenant>].sql         # 装载脚本
+└── .cache/                            # 可选的 Mimir 下载缓存
 ```
 
 ### 调参建议
 
 - 内存 ≈ 基础开销 + `block_parallel` × 每 worker 缓冲，与数据总量无关；压内存先降 `--block-parallel`，再降 `--batch-bytes-mb`。
-- 磁盘 IO 是常见瓶颈：`--unit-series` 保持在 5 万级，过小会产生大量小文件与 fsync。
+- 网络与接收端吞吐是常见瓶颈：`--batch-samples` 和 `--batch-bytes-mb` 控制请求大小，`--unit-series` 控制 checkpoint 与重放粒度。
 - 只想快速抽样验证时，用 `--match` 或 `--min-time/--max-time` 缩小范围。
 
 ## 开发与测试
@@ -253,8 +217,8 @@ TSDB_MIGRATE_TOKEN=change-me ./target/release/tsdb-migrate-server \
 cargo build --workspace
 cargo test --workspace
 
-scripts/e2e.sh              # fixture → Parquet → verify → DuckDB
-scripts/mimir-local-e2e.sh  # Mimir 布局双 tenant（同名 ULID）→ verify → DuckDB
+scripts/e2e.sh              # fixture → Remote Write 本地测试接收端
+scripts/mimir-local-e2e.sh  # Mimir tenant 布局 inspect/plan smoke test
 scripts/bench.sh gen 20000  # 生成基准块
 scripts/bench.sh            # release 吞吐 / RSS
 ```
@@ -268,18 +232,15 @@ scripts/sync-fixtures.sh    # 同步一份到 crates/tsdb-reader/tests/data
 
 ## 性能
 
-M 系列 10 核，release 构建：
-
-- 单块 20002 series / 2880 万样本：0.93–1.04 s，峰值 RSS 72–110 MiB。
-- 4 块 1.15 亿样本，`--block-parallel 4`：1.66 s，302 MiB，约 69.4 M samples/s。
+迁移吞吐取决于 Remote Write 接收端、网络、批次大小和解码并行度。设置 `TSDB_MIGRATE_BENCH_REMOTE_WRITE_URL` 后，可用 `scripts/bench.sh` 对测试接收端测量端到端吞吐与 RSS。
 
 ## 已知限制
 
 - 只读已落盘 Block，不读取 Head / WAL / `chunks_head`。
 - Mimir 不做远程 range 读取，按块下载到本地 cache 后处理。
 - 不解析 postings，label 过滤在 series 遍历时进行。
-- 不做跨块去重；输出保留 `block` 分区，重叠块会在 `inspect` 中告警。
-- 单线程 chunk 吞吐约 45 MB/s（多块并发约 113 MB/s），未达到 100 MB/s 的单线程目标。
+- 不做跨块去重；同一 tenant 时间范围重叠的 block 会被拒绝，以保证 Remote Write 样本顺序。
+- 为保证时间顺序，Remote Write 会将 block 并行度设为 1；块内解码仍可并行。
 - Remote Write v1.0 无 native histogram；且 HTTP 写入与本地 checkpoint 不是一个事务，异常退出后当前批可能重发（接收端对相同 series+时间戳幂等）。
 - `migrate-core::mimir::s3_download_tests` 有 2 个用例当前失败（断点续传的请求次数断言），与迁移主链路无关，待修。
 
@@ -288,7 +249,7 @@ M 系列 10 核，release 构建：
 ```
 crates/
   tsdb-reader/           # 格式层：meta/index/chunks/tombstones/chunkenc（可独立发布）
-  migrate-core/          # 规划、流水线、控制、checkpoint、sink、manifest、DuckDB
+  migrate-core/          # 规划、流水线、控制、checkpoint、Remote Write、manifest
   tsdb-migrate-cli/      # tsdb-migrate 二进制
   tsdb-migrate-server/   # tsdb-migrate-server 二进制（内嵌 web/）
 web/                     # 单页控制台（无构建、无外链）
@@ -335,6 +296,6 @@ Copyright (c) 2026 zhuyanxi
 
 - [Prometheus](https://github.com/prometheus/prometheus)：TSDB 格式文档与 chunk 编解码的参考实现（Apache-2.0）。
 - [Grafana Mimir](https://github.com/grafana/mimir)：对象存储布局与 tenant 机制的参考。
-- [Apache Arrow / parquet-rs](https://github.com/apache/arrow-rs)、[DuckDB](https://duckdb.org)：列式落地与查询。
+- [Prometheus Remote Write](https://prometheus.io/docs/specs/prw/remote_write_spec/)：兼容的远端写入协议。
 
 问题与建议请提 [GitHub Issues](https://github.com/zhuyanxi/migrate-tsdb/issues)；安全问题请勿公开提交，直接联系维护者 [@zhuyanxi](https://github.com/zhuyanxi)。

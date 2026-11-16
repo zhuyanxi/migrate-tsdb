@@ -1,6 +1,6 @@
 # Prometheus Remote Write v1.0 Sink
 
-> 目标：把 TSDB Block 直接推到任意兼容 [Remote Write 1.0](https://prometheus.io/docs/specs/prw/remote_write_spec/) 的接收端（Prometheus、Mimir、Thanos、Cortex、VictoriaMetrics、GreptimeDB…），不落 Parquet。
+> 当前唯一输出：把 TSDB Block 直接推到任意兼容 [Remote Write 1.0](https://prometheus.io/docs/specs/prw/remote_write_spec/) 的接收端（Prometheus、Mimir、Thanos、Cortex、VictoriaMetrics、GreptimeDB…），不落样本数据文件。
 >
 > 实现：`crates/migrate-core/src/sink/remote_write.rs`。
 
@@ -21,7 +21,7 @@ WriteRequest { timeseries[] }  ──prost──▶  protobuf
 HTTP POST  ──▶  <remote_write_url>
 ```
 
-- Parquet / DuckDB 链路完全不受影响；`sink.kind=remote_write` 时引擎会跳过 DuckDB 收尾。
+- 本地只写任务状态、manifest 和 block 完成标记，不保存样本数据。
 - 一个 Batch 一次请求；请求体大小由 `options.batch_samples` / `options.batch_bytes` 控制。
 - 客户端为**进程级共享**（`OnceLock<Client>`）：sink 是「每 block × 每 worker 一个」创建的，独占 client 会导致每个 block 重建连接池与线程池。
 
@@ -94,7 +94,6 @@ HTTP POST  ──▶  <remote_write_url>
 
 | 位置 | 字段 | 说明 |
 |------|------|------|
-| CLI | `--sink remote-write` | 选择 sink |
 | CLI | `--remote-write-url` | 完整 URL |
 | CLI | `--remote-write-tenant-header` | 默认 `X-Scope-OrgID`；留空表示不发送 |
 | API/配置 | `sink.kind = "remote_write"` | |
@@ -117,7 +116,7 @@ Tenant 规则：
 | 无 native histogram | v1.0 协议无该字段；遇直方图样本直接失败，避免静默丢数 |
 | 不支持 metadata / exemplars | v1.0 未纳入规范 |
 | 重叠 block 被拒绝 | 见 §3 |
-| 本地无产物 | `blocks/` 下只写 `_complete.json`，`verify` 对 remote-write 任务没有意义 |
+| 本地无样本数据 | `blocks/` 下只写 `_complete.json`；数据校验需在接收端完成 |
 | 无持久化缓冲 | 进程退出后未发送的数据依赖 checkpoint 重放（unit 粒度） |
 | 超时固定 30s | 大 batch 走慢链路时可能超时，可下调 `batch_bytes` 规避 |
 

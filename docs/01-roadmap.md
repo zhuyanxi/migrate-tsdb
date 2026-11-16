@@ -1,5 +1,7 @@
 # 分阶段实现方案与验收标准
 
+> 历史路线图；Parquet、NDJSON、DuckDB 条目记录旧版本实现，不代表当前支持的输出目标。当前唯一 sink 为 Remote Write v1.0。
+
 > 原则：每个阶段都必须**可运行、可验证**，后一阶段不依赖未完成的承诺。阶段间允许并行，但验收门槛必须逐条通过。
 >
 > 文中命令均在仓库根目录执行；`FIXTURE` 指 `fixtures/gen/data`。
@@ -236,7 +238,7 @@ tsdb-migrate migrate --data-dir <dir> --out <dir> \
   - label 与保留列冲突时重命名为 `label_<name>`。
 - CLI `duckdb-load`：`--db`（Prometheus 文件 / Mimir 目录）、`--no-exec`、`--print-sql`。
 - Engine：Parquet sink 也生成 SQL；DuckDB sink 按 tenant 执行；失败只告警，不影响迁移结果。
-- 文档：`docs/07-duckdb-schema.md`；更新 00/03/04/05/06/README。
+- 文档：旧版 DuckDB schema 说明（随旧 sink 移除）；更新 00/03/04/05/06/README。
 
 ### 验收标准与结果
 

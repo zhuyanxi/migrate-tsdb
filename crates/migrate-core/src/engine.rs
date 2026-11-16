@@ -16,7 +16,7 @@ use tsdb_reader::{BlockReader, ReaderOptions, SeriesRef};
 
 use crate::batch::{Batch, BatchLimits, FloatRow, HistRow, SeriesRow};
 use crate::checkpoint::{self, BlockCheckpoint};
-use crate::config::{EngineOptions, FilterConfig, JobConfig, SinkKind};
+use crate::config::{EngineOptions, FilterConfig, JobConfig};
 use crate::control::{Control, JobState};
 use crate::error::{Error, Result};
 use crate::manifest;
@@ -75,12 +75,10 @@ impl Engine {
         started_ms: Option<i64>,
     ) -> Result<Self> {
         cfg.validate()?;
-        if cfg.sink.kind == SinkKind::RemoteWrite {
-            sink::remote_write::validate_config(
-                &cfg.sink.remote_write_url,
-                &cfg.sink.remote_write_tenant_header,
-            )?;
-        }
+        sink::remote_write::validate_config(
+            &cfg.sink.remote_write_url,
+            &cfg.sink.remote_write_tenant_header,
+        )?;
         let mimir = match &cfg.mimir {
             Some(m) => Some(Arc::new(MimirSource::new(m, &cfg.output_dir)?)),
             None => None,
@@ -89,17 +87,15 @@ impl Engine {
             Some(source) => source.plan(&cfg)?,
             None => planner::plan(&cfg)?,
         };
-        if cfg.sink.kind == SinkKind::RemoteWrite {
-            if cfg.options.block_parallel != 1 {
-                events.log(
-                    LogLevel::Warn,
-                    "remote_write serializes blocks to preserve per-series timestamp order",
-                );
-                cfg.options.block_parallel = 1;
-            }
-            check_remote_write_tenants(&plan, &cfg.sink.remote_write_tenant_header, &*events)?;
-            order_remote_write_blocks(&mut plan)?;
+        if cfg.options.block_parallel != 1 {
+            events.log(
+                LogLevel::Warn,
+                "remote_write serializes blocks to preserve per-series timestamp order",
+            );
+            cfg.options.block_parallel = 1;
         }
+        check_remote_write_tenants(&plan, &cfg.sink.remote_write_tenant_header, &*events)?;
+        order_remote_write_blocks(&mut plan)?;
         let stats = Arc::new(JobStats::new(job_id, cfg.clone(), &plan.blocks, started_ms));
         for w in &plan.warnings {
             events.log(LogLevel::Warn, w);
@@ -189,15 +185,6 @@ impl Engine {
         sink::check_writable(&self.cfg.output_dir)?;
         std::fs::create_dir_all(self.cfg.state_dir().join("blocks"))?;
         std::fs::create_dir_all(self.cfg.blocks_dir())?;
-        let estimate = planner::estimated_output_bytes(&self.plan);
-        self.events.log(
-            LogLevel::Info,
-            &format!(
-                "预计输出 {:.2} GiB（Parquet/zstd 估算，实际以落盘为准）",
-                estimate as f64 / (1024.0 * 1024.0 * 1024.0)
-            ),
-        );
-
         let n_workers = self.cfg.options.block_parallel.max(1);
         self.control.set_active_blocks(n_workers);
         let queue = Mutex::new(VecDeque::from(self.plan.blocks.clone()));
@@ -290,78 +277,6 @@ impl Engine {
         if let Err(e) = manifest::write(&self.cfg.output_dir, &self.stats, state, warnings) {
             self.events
                 .log(LogLevel::Warn, &format!("写 manifest 失败：{e}"));
-        }
-
-        if state == JobState::Completed
-            && !matches!(self.cfg.sink.kind, SinkKind::Ndjson | SinkKind::RemoteWrite)
-        {
-            match crate::duckdb::plan_with_sink(&self.cfg.output_dir, &self.cfg.sink) {
-                Ok(plans) => {
-                    for p in &plans {
-                        let mut scope = match &p.tenant {
-                            Some(t) => format!("tenant {t}"),
-                            None => "Prometheus".to_string(),
-                        };
-                        if let Some(window) = p.window {
-                            scope = format!("{scope} window {window}");
-                        }
-                        self.events.log(
-                            LogLevel::Info,
-                            &format!(
-                                "DuckDB schema [{scope}]: {} metric table(s) → {}",
-                                p.metrics,
-                                p.sql_path.display()
-                            ),
-                        );
-                        // Capacity plan: the database itself is the floor for the
-                        // disk budget, so surface the estimate before the load runs.
-                        let estimate = p.estimated_db_bytes();
-                        self.events.log(
-                            if estimate > p.limits.disk_bytes {
-                                LogLevel::Warn
-                            } else {
-                                LogLevel::Info
-                            },
-                            &format!(
-                                "DuckDB [{scope}]: samples={} → 预计数据库 ~{:.1} GiB（按 22 B/样本估算），磁盘预算 {:.0} GiB，staging 压缩 zstd",
-                                p.samples,
-                                estimate as f64 / (1024.0 * 1024.0 * 1024.0),
-                                p.limits.disk_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-                            ),
-                        );
-                        if estimate > p.limits.disk_bytes {
-                            self.events.log(
-                                LogLevel::Warn,
-                                "  磁盘预算小于预计数据库大小：装载会在 watchdog 处中止。请调大 sink.duckdb_disk_limit_mb，或改用 parquet sink 直接查询",
-                            );
-                        }
-                        if !p.warnings.is_empty() {
-                            self.events.log(
-                                LogLevel::Warn,
-                                &format!(
-                                    "DuckDB schema [{scope}]: {} label column(s) renamed due to reserved names",
-                                    p.warnings.len()
-                                ),
-                            );
-                        }
-                        if self.cfg.sink.kind == SinkKind::Duckdb && self.cfg.sink.duckdb_exec {
-                            match crate::duckdb::execute(p) {
-                                Ok(()) => self.events.log(
-                                    LogLevel::Info,
-                                    &format!("DuckDB 装载完成 [{scope}]：{}", p.db_path.display()),
-                                ),
-                                Err(e) => self.events.log(
-                                    LogLevel::Warn,
-                                    &format!("DuckDB 装载跳过 [{scope}]：{e}"),
-                                ),
-                            }
-                        }
-                    }
-                }
-                Err(e) => self
-                    .events
-                    .log(LogLevel::Warn, &format!("生成 DuckDB metric 表失败：{e}")),
-            }
         }
 
         let totals = self.stats.totals();
@@ -506,13 +421,6 @@ impl Engine {
                 ckpt.bytes_read,
                 ckpt.next_offset,
             );
-            let removed = checkpoint::cleanup_uncommitted_parts(&out_dir, ckpt.completed_unit)?;
-            if removed > 0 {
-                self.events.log(
-                    LogLevel::Info,
-                    &format!("block {block_id}: 清理 {} 个未提交 part 文件", removed),
-                );
-            }
             self.events.log(
                 LogLevel::Info,
                 &format!(
@@ -557,11 +465,6 @@ impl Engine {
                 return Err(e);
             }
         };
-        let bytes_written = sink::dir_size(&out_dir);
-        block_stats
-            .bytes_written
-            .store(bytes_written, Ordering::Relaxed);
-
         match outcome {
             PipelineOutcome::Completed => {
                 let next_offset = block_stats.next_offset.load(Ordering::Relaxed);
@@ -571,11 +474,10 @@ impl Engine {
                 self.events.log(
                     LogLevel::Info,
                     &format!(
-                        "block {block_id}: 完成（samples={}，跳过 tombstone={}，输出 {:.2} MiB）",
+                        "block {block_id}: 完成（samples={}，跳过 tombstone={}，Remote Write；本地不保存样本）",
                         block_stats.floats_done.load(Ordering::Relaxed)
                             + block_stats.histograms_done.load(Ordering::Relaxed),
-                        block_stats.skipped_tombstone.load(Ordering::Relaxed),
-                        bytes_written as f64 / (1024.0 * 1024.0)
+                        block_stats.skipped_tombstone.load(Ordering::Relaxed)
                     ),
                 );
                 let _ = manifest::write(

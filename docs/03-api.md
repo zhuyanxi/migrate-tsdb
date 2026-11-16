@@ -118,7 +118,7 @@ GET /api/blocks?data_dir=<path>&scan=<bool>&limit=<n>
 ```json
 {
   "name": "mimir-prod",
-  "output_dir": "/mnt/duckdb/mimir",
+  "output_dir": "/var/lib/tsdb-migrate/mimir-job",
   "mimir": {
     "backend": "s3",
     "bucket": "bucketA",
@@ -137,17 +137,17 @@ GET /api/blocks?data_dir=<path>&scan=<bool>&limit=<n>
     "force_path_style": false
   },
   "filter": {"min_time": null, "max_time": null, "matchers": []},
-  "sink": {"kind": "duckdb", "compression": "zstd",
-           "duckdb_memory_limit_mb": 24576, "duckdb_disk_limit_mb": 204800,
-           "duckdb_threads": 0, "duckdb_temp_dir": ""},
-  "options": {"block_parallel": 2, "decode_workers": 4, "unit_series": 50000}
+  "sink": {"kind": "remote_write",
+           "remote_write_url": "https://receiver.example/api/v1/write",
+           "remote_write_tenant_header": "X-Scope-OrgID"},
+  "options": {"block_parallel": 1, "decode_workers": 4, "unit_series": 50000}
 }
 ```
 
 - `backend`: `s3` | `local`。`local` 时 `bucket` 是服务端可见的目录路径（用于测试/离线镜像），同样必须位于 `--allow-root` 下。
 - `tenants` 为空表示迁移该 bucket/prefix 下发现的全部 tenant。
 - S3 凭证只从服务端环境变量读取（`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` / `AWS_REGION`），不会出现在 API 请求或 job 状态中。
-- `cache_dir` 为空时使用 `<output_dir>/.cache`；建议与输出同盘，至少预留 `block_parallel × 单块大小` 空间。
+- `cache_dir` 为空时使用 `<output_dir>/.cache`；建议为最大并发下载预留足够空间。
 
 ### 4.3 Mimir Tenant 发现
 
@@ -203,7 +203,7 @@ Content-Type: application/json
 {
   "name": "prod-2026-11",
   "data_dir": "/prometheus/data",
-  "output_dir": "/mnt/duckdb/export",
+  "output_dir": "/var/lib/tsdb-migrate/job",
   "blocks": ["01H...", "01H..."],
   "filter": {
     "min_time": 1700000000000,
@@ -211,11 +211,9 @@ Content-Type: application/json
     "matchers": [{"name": "job", "value": "api"}]
   },
   "sink": {
-    "kind": "parquet",
-    "compression": "zstd",
-    "row_group_size": 65536,
-    "duckdb_path": "",
-    "duckdb_exec": true
+    "kind": "remote_write",
+    "remote_write_url": "https://receiver.example/api/v1/write",
+    "remote_write_tenant_header": "X-Scope-OrgID"
   },
   "options": {
     "block_parallel": 2,
@@ -236,14 +234,11 @@ Content-Type: application/json
 
 - `blocks` 为空表示全部块。
 - `filter.matchers` 是精确匹配，AND 关系；暂不支持正则。
-- `sink.kind`：`parquet` | `ndjson` | `duckdb`。`duckdb` = 先写 Parquet，完成后调用 `duckdb` CLI 装载。
-- `sink.kind` 也支持 `remote_write`：设置 `sink.remote_write_url` 为完整写入 URL，可选设置 `sink.remote_write_tenant_header`（默认 `X-Scope-OrgID`）。Bearer token 从服务端环境变量 `TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN` 读取，不进入任务状态文件。
+- `sink.kind` 固定为 `remote_write`；`sink.remote_write_url` 必填。`sink.remote_write_tenant_header` 默认 `X-Scope-OrgID`，留空表示不发送。Bearer token 从服务端环境变量 `TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN` 读取，不进入任务状态文件。
 - `remote_write_tenant_header` 可留空，但此时若计划中有多个 Mimir tenant 会直接返回配置错误（否则多个 tenant 的数据会混成一路）；仅单 tenant 时留空放行并记一条 Warn。
 - Remote Write v1.0 不支持 native histogram；遇到 histogram 样本时 block 失败（不静默丢弃）。同 unit 内已被其他 worker 推送的数据可能已到达接收端，需要按 tenant/series 清理后重跑。
 - Block 会按 tenant 和时间串行发送（`block_parallel` 被强制为 1）；同一 tenant 的 Block 时间范围重叠时拒绝迁移，以保证单个 series 的样本时间顺序。
 - 协议对照、重试语义、顺序保证与测试矩阵见 `08-remote-write-sink.md`。
-- `sink.duckdb_path`：Prometheus 源为 `.duckdb` 文件；Mimir 源为目录（每 tenant 一个 `<tenant>.duckdb`）。为空时使用默认路径。
-- DuckDB 最终为「每个 metric 一张表、label 作为列、包含 `timestamp`」；Prometheus 单实例、Mimir 每 tenant 独立实例。详见 `07-duckdb-schema.md`。
 - 创建时会同步执行 planning（扫描 `meta.json` / 必要时 index），返回时 `engine_ready=true`。
 - 同一个 `output_dir` 不允许被多个任务同时使用（避免 part/checkpoint 冲突）。
 
@@ -365,7 +360,7 @@ DELETE /api/jobs/{id}
 ```
 
 - 仅允许非活动任务（引擎线程已退出，且状态不在 running/pausing/stopping）。
-- 只删除 `state/jobs/<id>.json` 与内存记录，**保留输出数据**。
+- 只删除 `state/jobs/<id>.json` 与内存记录，不会撤回已写入 Remote Write 接收端的数据；本地任务状态目录不会删除。
 - 响应：`{"deleted":"<id>","output_kept":true}`。
 
 ---
@@ -381,7 +376,7 @@ DELETE /api/jobs/{id}
   "state": "running",
   "error": null,
   "data_dir": "/prometheus/data",
-  "output_dir": "/mnt/duckdb/export",
+  "output_dir": "/var/lib/tsdb-migrate/job",
   "started_at": "2026-11-09T14:31:40.238Z",
   "elapsed_ms": 12034,
   "totals": {
@@ -399,7 +394,7 @@ DELETE /api/jobs/{id}
     "units_total": 101,
     "units_done": 30,
     "bytes_read": 1200000,
-    "bytes_written": 800000,
+    "bytes_written": 0,
     "crc_errors": 0,
     "decode_errors": 0,
     "unknown_encodings": 0
@@ -419,7 +414,7 @@ DELETE /api/jobs/{id}
   },
   "eta_seconds": 42,
   "options": { "...": "同创建请求" },
-  "sink_kind": "parquet"
+  "sink_kind": "remote_write"
 }
 ```
 

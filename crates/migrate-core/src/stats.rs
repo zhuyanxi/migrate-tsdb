@@ -9,7 +9,7 @@ use std::sync::{Mutex, RwLock};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{EngineOptions, JobConfig, SinkKind};
+use crate::config::{EngineOptions, JobConfig};
 use crate::control::JobState;
 use crate::planner::PlannedBlock;
 
@@ -468,10 +468,7 @@ impl JobStats {
             rate,
             eta_seconds: eta,
             options: self.config.options.clone(),
-            sink_kind: match self.config.sink.kind {
-                SinkKind::RemoteWrite => "remote_write".to_string(),
-                kind => format!("{kind:?}").to_lowercase(),
-            },
+            sink_kind: "remote_write".to_string(),
         }
     }
 

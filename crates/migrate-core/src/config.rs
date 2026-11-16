@@ -24,15 +24,6 @@ fn default_unit_series() -> usize {
 fn default_channel_capacity() -> usize {
     2048
 }
-fn default_row_group_size() -> usize {
-    65_536
-}
-fn default_duckdb_memory_mb() -> u64 {
-    24 * 1024
-}
-fn default_duckdb_disk_mb() -> u64 {
-    200 * 1024
-}
 fn default_name() -> String {
     "migration".to_string()
 }
@@ -40,30 +31,13 @@ fn default_name() -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SinkKind {
-    Parquet,
-    Ndjson,
-    Duckdb,
     #[serde(rename = "remote_write")]
     RemoteWrite,
 }
 
 impl Default for SinkKind {
     fn default() -> Self {
-        SinkKind::Parquet
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Compression {
-    Zstd,
-    Snappy,
-    None,
-}
-
-impl Default for Compression {
-    fn default() -> Self {
-        Compression::Zstd
+        SinkKind::RemoteWrite
     }
 }
 
@@ -71,51 +45,6 @@ impl Default for Compression {
 #[serde(default)]
 pub struct SinkConfig {
     pub kind: SinkKind,
-    pub compression: Compression,
-    pub row_group_size: usize,
-    /// DuckDB output path. For a Prometheus source this is a `.duckdb` file
-    /// (default `<out>/migration.duckdb`). For a Mimir source it is a directory
-    /// (default `<out>/duckdb/`) containing one `<tenant>.duckdb` per tenant.
-    pub duckdb_path: String,
-    /// Execute the generated DuckDB load SQL with the `duckdb` CLI.
-    pub duckdb_exec: bool,
-    /// Memory cap for the DuckDB load step, in MiB. DuckDB spills to
-    /// `duckdb_temp_dir` instead of exceeding it.
-    #[serde(default = "default_duckdb_memory_mb")]
-    pub duckdb_memory_limit_mb: u64,
-    /// Budget for the load's **temporary** data, in MiB: the staging Parquet in
-    /// `<out>/.duckdb_stage` plus DuckDB's spill files. Exceeding it aborts the
-    /// load and the database is not published (0 = no limit).
-    #[serde(default = "default_duckdb_disk_mb")]
-    pub duckdb_stage_limit_mb: u64,
-    /// Optional cap for the load's **total** footprint, in MiB: temporary data
-    /// plus the database being written (`<db>.tmp`). `0` (default) leaves the
-    /// database unbounded - note it is usually several times the staging size.
-    pub duckdb_disk_limit_mb: u64,
-    /// Threads for the DuckDB load step; `0` keeps DuckDB's default.
-    pub duckdb_threads: usize,
-    /// Directory for DuckDB spill files; empty = `<out>/.duckdb_stage/.spill`.
-    pub duckdb_temp_dir: String,
-    /// Build the metric tables in batches of this many metrics, deleting each
-    /// batch's staging Parquet right after it is loaded. `0` builds everything
-    /// in one DuckDB process. Batching keeps the peak disk usage near
-    /// `staging + database` instead of holding both at full size.
-    pub duckdb_metric_batch: usize,
-    /// Delete the Parquet export (`blocks/<tenant>`) once staging is complete.
-    /// Frees one full copy of the export for the table phase, but the data then
-    /// only exists inside DuckDB and a re-run needs a fresh migration.
-    pub duckdb_drop_export: bool,
-    /// Split the load into one database per time window of this many minutes,
-    /// e.g. 60 for "one DuckDB file per hour". Files are named
-    /// `<YYYY-MM-DDTHH>-<original name>` and built in timestamp order.
-    /// `0` (default) keeps one database for the whole export.
-    pub duckdb_window_minutes: u64,
-    /// Stage and load one block at a time instead of the whole export at once:
-    /// each block is staged, its metric tables are created/extended, then both
-    /// its staging and (with `duckdb_drop_export`) its export are deleted.
-    /// Peak disk becomes "database + one block's staging" instead of
-    /// "whole staging + database".
-    pub duckdb_chunk_by_block: bool,
     /// Full Prometheus Remote Write v1.0 endpoint URL.
     pub remote_write_url: String,
     /// Header used to forward Mimir tenant IDs; empty disables it.
@@ -126,20 +55,7 @@ pub struct SinkConfig {
 impl Default for SinkConfig {
     fn default() -> Self {
         Self {
-            kind: SinkKind::Parquet,
-            compression: Compression::Zstd,
-            row_group_size: default_row_group_size(),
-            duckdb_path: String::new(),
-            duckdb_exec: true,
-            duckdb_memory_limit_mb: default_duckdb_memory_mb(),
-            duckdb_stage_limit_mb: default_duckdb_disk_mb(),
-            duckdb_disk_limit_mb: 0,
-            duckdb_threads: 0,
-            duckdb_temp_dir: String::new(),
-            duckdb_metric_batch: 0,
-            duckdb_drop_export: false,
-            duckdb_chunk_by_block: false,
-            duckdb_window_minutes: 0,
+            kind: SinkKind::RemoteWrite,
             remote_write_url: String::new(),
             remote_write_tenant_header: default_remote_write_tenant_header(),
         }
@@ -489,45 +405,10 @@ impl JobConfig {
         if o.channel_capacity == 0 {
             return Err(Error::config("channel_capacity must be >= 1"));
         }
-        if self.sink.row_group_size == 0 {
-            return Err(Error::config("row_group_size must be >= 1"));
-        }
-        if self.sink.duckdb_window_minutes > 24 * 60 {
-            return Err(Error::config(
-                "sink.duckdb_window_minutes must be 0 (single database) or <= 1440",
-            ));
-        }
-        if self.sink.duckdb_memory_limit_mb < 256 {
-            return Err(Error::config(
-                "sink.duckdb_memory_limit_mb must be >= 256 (DuckDB needs a workable cache)",
-            ));
-        }
-        if self.sink.duckdb_stage_limit_mb != 0
-            && self.sink.duckdb_stage_limit_mb < self.sink.duckdb_memory_limit_mb
-        {
-            return Err(Error::config(
-                "sink.duckdb_stage_limit_mb must be >= sink.duckdb_memory_limit_mb (spill needs room)",
-            ));
-        }
-        if self.sink.duckdb_disk_limit_mb != 0
-            && self.sink.duckdb_disk_limit_mb < self.sink.duckdb_stage_limit_mb
-        {
-            return Err(Error::config(
-                "sink.duckdb_disk_limit_mb must be >= sink.duckdb_stage_limit_mb (temporary data is part of the total)",
-            ));
-        }
-        if self.sink.kind == SinkKind::RemoteWrite && self.sink.remote_write_url.trim().is_empty() {
-            return Err(Error::config(
-                "sink.remote_write_url is required for remote_write",
-            ));
-        }
         if let (Some(min), Some(max)) = (self.filter.min_time, self.filter.max_time) {
             if min > max {
                 return Err(Error::config("filter.min_time > filter.max_time"));
             }
-        }
-        if self.sink.kind == SinkKind::Duckdb && self.sink.duckdb_path.is_empty() {
-            // Allowed: default path is derived from output_dir.
         }
         Ok(())
     }
@@ -568,17 +449,5 @@ mod tests {
         assert!(!f.accepts_ts(21));
         assert!(!f.chunk_relevant(0, 9));
         assert!(f.chunk_relevant(0, 10));
-    }
-
-    #[test]
-    fn remote_write_requires_an_endpoint() {
-        let mut c = JobConfig::default();
-        c.data_dir = "/tmp/input".into();
-        c.output_dir = "/tmp/output".into();
-        c.sink.kind = SinkKind::RemoteWrite;
-        assert!(c.validate().is_err());
-
-        c.sink.remote_write_url = "https://receiver.example/api/v1/write".to_string();
-        c.validate().unwrap();
     }
 }

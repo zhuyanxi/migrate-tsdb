@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
-use migrate_core::config::{JobConfig, SinkKind};
+use migrate_core::config::JobConfig;
 use migrate_core::control::{Control, JobState};
 use migrate_core::engine::{Engine, EventSink, LogLevel};
 use migrate_core::error::{Error, Result};
@@ -295,12 +295,7 @@ fn minimal_snapshot(config: &JobConfig, id: &str, created_at: i64) -> JobSnapsho
         rate: Default::default(),
         eta_seconds: None,
         options: config.options.clone(),
-        sink_kind: match config.sink.kind {
-            SinkKind::Parquet => "parquet".into(),
-            SinkKind::Ndjson => "ndjson".into(),
-            SinkKind::Duckdb => "duckdb".into(),
-            SinkKind::RemoteWrite => "remote_write".into(),
-        },
+        sink_kind: "remote_write".into(),
     }
 }
 

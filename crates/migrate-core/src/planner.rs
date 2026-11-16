@@ -164,16 +164,6 @@ pub fn plan(cfg: &JobConfig) -> Result<Plan> {
     })
 }
 
-/// Estimates output bytes for a pre-flight disk space check.
-pub fn estimated_output_bytes(plan: &Plan) -> u64 {
-    // Parquet with zstd typically lands around 0.5-0.9x the compressed chunk
-    // size; use 1.1x plus 2 MiB per block of metadata as a safety margin.
-    plan.blocks
-        .iter()
-        .map(|b| (b.info.chunks_bytes as f64 * 1.1) as u64 + 2 * 1024 * 1024)
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

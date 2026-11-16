@@ -18,7 +18,7 @@ use snap::raw::Encoder;
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
-use crate::sink::{BatchSink, SinkOutcome};
+use crate::sink::BatchSink;
 
 const BEARER_TOKEN_ENV: &str = "TSDB_MIGRATE_REMOTE_WRITE_BEARER_TOKEN";
 const MAX_ATTEMPTS: usize = 5;
@@ -149,6 +149,11 @@ impl RemoteWriteSink {
 }
 
 pub fn validate_config(url: &str, tenant_header: &str) -> Result<()> {
+    if url.trim().is_empty() {
+        return Err(Error::config(
+            "sink.remote_write_url is required for remote_write",
+        ));
+    }
     let url = Url::parse(url.trim())
         .map_err(|e| Error::config(format!("invalid remote_write URL: {e}")))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -198,8 +203,8 @@ impl BatchSink for RemoteWriteSink {
         Ok(())
     }
 
-    fn end_block(&mut self) -> Result<SinkOutcome> {
-        Ok(SinkOutcome::default())
+    fn end_block(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 

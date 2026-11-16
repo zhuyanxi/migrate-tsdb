@@ -493,6 +493,7 @@ fn shares_one_connection_across_batches() {
 
 #[test]
 fn validates_endpoint_and_tenant_header() {
+    assert!(validate_config("", "").is_err());
     assert!(validate_config("https://receiver.example/api/v1/write", "X-Scope-OrgID").is_ok());
     assert!(validate_config("http://127.0.0.1:9009/write", "").is_ok());
     assert!(validate_config("ftp://receiver.example/write", "").is_err());
@@ -504,6 +505,7 @@ fn validates_endpoint_and_tenant_header() {
 
 #[test]
 fn rejects_endpoint_errors_before_sending() {
+    assert!(RemoteWriteSink::new("", "", "").is_err());
     assert!(RemoteWriteSink::new("ftp://receiver.example/write", "", "").is_err());
     assert!(RemoteWriteSink::new("https://user:pass@receiver.example/write", "", "").is_err());
     assert!(

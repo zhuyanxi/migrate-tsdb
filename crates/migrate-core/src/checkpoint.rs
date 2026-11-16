@@ -74,7 +74,6 @@ pub fn load(state_dir: &Path, tenant: &str, block: &str) -> Result<Option<BlockC
         Err(e) => Err(e.into()),
     }
 }
-
 pub fn save(state_dir: &Path, ckpt: &BlockCheckpoint) -> Result<()> {
     let path = checkpoint_path(state_dir, &ckpt.tenant, &ckpt.block);
     if let Some(parent) = path.parent() {
@@ -98,49 +97,5 @@ pub fn remove(state_dir: &Path, tenant: &str, block: &str) -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
-    }
-}
-
-/// Removes part files that belong to units after `completed_unit` (including
-/// the potentially half-written current unit).
-pub fn cleanup_uncommitted_parts(block_dir: &Path, completed_unit: i64) -> Result<usize> {
-    let mut removed = 0;
-    for dataset in ["series", "samples", "histograms"] {
-        let dir = block_dir.join(dataset);
-        let Ok(rd) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in rd.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(unit) = parse_part_unit(name) else {
-                continue;
-            };
-            if unit as i64 > completed_unit {
-                if std::fs::remove_file(entry.path()).is_ok() {
-                    removed += 1;
-                }
-            }
-        }
-    }
-    Ok(removed)
-}
-
-fn parse_part_unit(name: &str) -> Option<u64> {
-    let rest = name.strip_prefix("part-u")?;
-    let end = rest.find("-w")?;
-    rest[..end].parse().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_names() {
-        assert_eq!(parse_part_unit("part-u000123-w00.parquet"), Some(123));
-        assert_eq!(parse_part_unit("part-u999999-w03.parquet"), Some(999999));
-        assert_eq!(parse_part_unit("part-000123-w00.parquet"), None);
-        assert_eq!(parse_part_unit("_complete.json"), None);
     }
 }

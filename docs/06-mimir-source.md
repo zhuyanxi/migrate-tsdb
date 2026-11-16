@@ -1,8 +1,8 @@
 # Grafana Mimir 数据源接入说明
 
-> 本文专门说明新增的 Mimir 对象存储数据源：如何接入、数据如何定位、各层改了哪些代码、与原有本地目录源如何兼容。
+> 本文专门说明 Mimir 对象存储数据源：如何接入、数据如何定位，以及 tenant 如何通过 Remote Write 路由。
 >
-> 通用格式见 `02-format-notes.md` §9；部署/凭证见 `04-operations.md` §7；验证见 `05-verification.md` §10。
+> 通用格式见 `02-format-notes.md` §9；部署/凭证见 `04-operations.md` §7；Remote Write 协议见 `08-remote-write-sink.md`。
 
 ---
 
@@ -162,11 +162,10 @@ object_store 对 body 流的内部重试还受 `RetryConfig::retry_timeout`（�
 | 规划 | `migrate-core/src/engine.rs` | 有 `mimir` 时构造 `MimirSource` 并调用 `source.plan()`；本地走原 `planner::plan()` |
 | Block 身份 | `tsdb-reader/src/meta.rs` | `BlockInfo` 增加 `tenant`/`remote`/`key()`；本地源填空 |
 | 统计 | `migrate-core/src/stats.rs` | `BlockStats`/`BlockSnapshot` 增加 key/tenant；`Totals.tenants` |
-| 输出 | `migrate-core/src/sink/mod.rs` | Mimir 路径 `blocks/tenant=<t>/block=<ulid>`；本地保持 `blocks/block=<ulid>` |
+| 本地标记 | `migrate-core/src/sink/mod.rs` | Mimir 路径 `blocks/tenant=<t>/block=<ulid>/_complete.json`；本地保持 `blocks/block=<ulid>/_complete.json` |
 | Checkpoint | `migrate-core/src/checkpoint.rs` | `tenant` 字段；路径 `state/blocks/<tenant>/<ulid>.json`；本地路径不变 |
 | 执行 | `migrate-core/src/engine.rs` | block 开始前 `materialize`；完成后 `cleanup`；失败/暂停保留缓存 |
-| DuckDB | `migrate-core/src/duckdb.rs` | 为每个 tenant 生成独立实例 `<out>/duckdb/<tenant>.duckdb`；每个 metric 一张宽表 |
-| CLI | `tsdb-migrate-cli/src/main.rs` | `--mimir-*` 参数；inspect/plan/migrate 支持 Mimir；verify tenant 路径 |
+| CLI | `tsdb-migrate-cli/src/main.rs` | `--mimir-*` 参数；inspect/plan/migrate 支持 Mimir，Remote Write 按 tenant header 路由 |
 | API | `tsdb-migrate-server/src/api.rs` | `/api/mimir/tenants`；create 支持 `mimir`/可选 `data_dir`；路径校验 |
 | Web | `web/*` | 数据源切换、tenant 扫描/勾选、tenant 列、配置展示 |
 
@@ -181,31 +180,30 @@ object_store 对 body 流的内部重试还受 `RetryConfig::retry_timeout`（�
 | 配置 | `data_dir` | `mimir` |
 | Block 定位 | `data_dir/<ULID>` | `<prefix>/<tenant>/<ULID>` |
 | 内部 key | `<ULID>` | `<tenant>/<ULID>` |
-| 输出 | `blocks/block=<ULID>/` | `blocks/tenant=<t>/block=<ULID>/` |
+| 本地完成标记 | `blocks/block=<ULID>/_complete.json` | `blocks/tenant=<t>/block=<ULID>/_complete.json` |
 | checkpoint | `.state/blocks/<ULID>.json` | `.state/blocks/<tenant>/<ULID>.json` |
-| DuckDB | 单实例 `migration.duckdb`，每 metric 一张表 | 每 tenant 一个实例 `duckdb/<tenant>.duckdb`，每 metric 一张表 |
+| Remote Write tenant | 不设置 tenant header | 默认发送 `X-Scope-OrgID` |
 | 缓存 | 无 | `<out>/.cache`，完成后清理 |
 | CLI | `--data-dir` | `--mimir-bucket` 或 `--mimir-local-root` |
 | API | `data_dir` | `mimir` |
 | 已有任务/状态 | 不变 | 新增字段有 serde default，可读旧 manifest/checkpoint |
 
-本地源的路径、checkpoint、输出 schema 与之前完全一致；新增字段都是向后兼容的可选字段。
+本地源与 Mimir 源都只在本地保存 checkpoint、manifest 和完成标记；样本数据统一写入 Remote Write 接收端。
 
 ---
 
-## 4.1 DuckDB 输出
+## 4.1 Remote Write tenant 路由
 
-- Prometheus 源：单个 `<out>/migration.duckdb`。
-- Mimir 源：每个 tenant 一个 `<out>/duckdb/<tenant>.db`（实际扩展名 `.duckdb`），表结构完全一致；tenant 之间不共享数据库。
-- 每个 metric 一张表（表名 = metric name），label 作为列，另有 `timestamp` 与 `value`（直方图为 count/sum/buckets 等）。
-- 详细表结构见 `07-duckdb-schema.md`。
+- Mimir tenant 默认通过 `X-Scope-OrgID` header 分别写入接收端的 tenant。
+- 单 tenant 任务可以将 `remote_write_tenant_header` 留空；多 tenant 任务留空会被拒绝，避免 tenant 数据合并。
+- Remote Write v1.0 不支持 native histogram，遇到时 block 会失败而不静默丢弃。
 
 ## 5. 并发、内存与 IO
 
-- 对象下载与块解码是**串行阶段**：一个块先完整下载，再进入现有 pipeline；不同块可以并行（`block_parallel`）。
+- 对象下载与块解码是**串行阶段**：一个块先完整下载，再进入现有 pipeline；Remote Write 将 `block_parallel` 固定为 1 以保证 tenant 内样本时间顺序。
 - 下载缓存占用的是**磁盘**，不是堆内存；单块下载的并发流有界，内存 ≈ 并发流 buffer。
-- 对象存储延迟高时，提高 `max_concurrent_downloads` 可以缩短单块下载时间；但总带宽受 `block_parallel` 限制。
-- 同一 tenant 的块串行还是并行取决于 `block_parallel`；Mimir 的 LIST 顺序不作为迁移顺序依赖。
+- 对象存储延迟高时，提高 `max_concurrent_downloads` 可以缩短单块下载时间；处理块的并行度由 Remote Write 顺序约束固定为 1。
+- Mimir 的 LIST 顺序不作为迁移顺序依赖；引擎按 tenant 和时间排序，并拒绝同 tenant 时间范围重叠的块。
 
 ---
 
